@@ -1,0 +1,13 @@
+The Esp32 was hot when I first plugged it, 
+I later realised there was a short circuit in one of the connections on the vero board which i made corrections to
+
+I tried uploading the codes thereafter for couple of times but it kept showing
+"A fatal error occurred: Failed to connect to ESP32: No serial data received"
+
+I tried couple of things to fix the problem, I checked the drivers, the board which was selected,
+tried changing the upload speed from 921600 to 115200,
+tried an older arduino software....all failed
+
+Until I realised the board itself might have gotten a problem which made me try a new board 
+
+and BOOM!! It uploaded smoothly
