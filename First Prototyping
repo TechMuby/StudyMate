@@ -1,150 +1,422 @@
+/*
+  StudyMate Firmware
+  Hardware: ESP32 + I2C LCD 20x4
+  Buttons: 2 buttons (BTN_A = select/up, BTN_B = down/back)
+
+  Button logic by screen:
+  ─────────────────────────────────────────
+  Splash screen       → auto-advance after 3s
+  Main menu           → BTN_A = move cursor  |  BTN_B (long) = select
+  Session select      → BTN_A = move cursor  |  BTN_B = select / BTN_A long = back
+  Running timer       → BTN_A = pause/resume |  BTN_B (long) = back to main menu
+  Exercise running    → BTN_A = pause/resume |  BTN_B (long) = back to main menu
+  ─────────────────────────────────────────
+  Long press = hold > 600ms
+*/
+
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// I2C LCD (SDA=16, SCL=17)
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-// Buttons
-#define BTN_START 27
-#define BTN_MODE  26
+#define BTN_A 27   // Select / Up / Pause
+#define BTN_B 26   // Down / Back (long press)
 
-// Modes
-enum Mode { POMODORO, DEEP };
-Mode currentMode = POMODORO;
+// ── App States ────────────────────────────────────────────
+enum AppState {
+  STATE_SPLASH,
+  STATE_MAIN_MENU,
+  STATE_SESSION_SELECT,
+  STATE_STUDY_RUNNING,
+  STATE_EXERCISE_RUNNING
+};
 
-bool isRunning = false;
-bool isStudy = true;
+AppState appState = STATE_SPLASH;
 
-unsigned long previousMillis = 0;
-const unsigned long interval = 1000;
+// ── Splash ─────────────────────────────────────────────────
+unsigned long splashStart = 0;
 
-int studyMinutes = 25;
-int breakMinutes = 5;
+// ── Main Menu ──────────────────────────────────────────────
+int menuCursor = 0;  // 0 = Study Session, 1 = Exercise Mode
 
-int totalSeconds;
-long xp = 0;
-int streak = 0;
+// ── Session Select ─────────────────────────────────────────
+int sessionCursor = 0;           // 0=10min, 1=30min, 2=60min
+const int sessionOptions[] = {10, 30, 60};
 
+// ── Study Timer ────────────────────────────────────────────
+long studyTotalSeconds = 0;
+bool studyRunning = false;
+bool studyPaused = false;
+unsigned long studyPrevMillis = 0;
+
+// ── Exercise Routine ───────────────────────────────────────
+struct ExerciseMove {
+  int atSecond;       // second mark when this exercise STARTS showing
+  const char* name;
+};
+
+// Each entry = "at this second into the 10-min session, switch to this exercise"
+// The exercise is displayed until the next entry
+const ExerciseMove exercises[] = {
+  {0,   "Get Ready!"},
+  {27,  "Jack Squats"},
+  {57,  "Push-Ups"},
+  {87,  "Caterpillars"},
+  {117, "Inch Worms"},
+  {147, "Elbow Plank"},
+  {177, "Cat Stretch"},
+  {207, "Wats Up Dawg"},
+  {237, "Heel Tap Crunch"},
+  {267, "Hip Thrust"},
+  {297, "Squat Pulse+Calf"},
+  {357, "Eagle Walks"},
+  {387, "Upright Plank"},
+  {417, "Hamstring Stretch"},
+  {477, "Superman Strokes"},
+  {507, "Negative Push-Ups"},
+  {537, "Hip Stretch Lunge"},
+  {567, "Squat Taps"},
+  {597, "Jumping Jacks"},
+};
+const int NUM_EXERCISES = sizeof(exercises) / sizeof(exercises[0]);
+const int EXERCISE_TOTAL = 600; // 10 minutes
+
+long exerciseElapsed = 0;       // seconds elapsed in exercise session
+bool exerciseRunning = false;
+bool exercisePaused = false;
+unsigned long exercisePrevMillis = 0;
+int currentExerciseIdx = 0;
+
+// ── Button Handling ────────────────────────────────────────
+unsigned long btnA_pressTime = 0;
+unsigned long btnB_pressTime = 0;
+bool btnA_held = false;
+bool btnB_held = false;
+bool btnA_processed = false;
+bool btnB_processed = false;
+const unsigned long LONG_PRESS = 600;
+const unsigned long DEBOUNCE = 50;
+
+// Returns true on SHORT press (released quickly)
+// Sets *longFired = true if long press threshold crossed (fires once)
+void handleBtn(int pin,
+               unsigned long &pressTime,
+               bool &held,
+               bool &processed,
+               bool &shortPress,
+               bool &longPress) {
+  shortPress = false;
+  longPress  = false;
+  int state = digitalRead(pin);
+
+  if (state == LOW) {
+    if (!held) {
+      held = true;
+      processed = false;
+      pressTime = millis();
+    } else if (!processed && (millis() - pressTime >= LONG_PRESS)) {
+      longPress = true;
+      processed = true;
+    }
+  } else {
+    if (held) {
+      if (!processed && (millis() - pressTime >= DEBOUNCE)) {
+        shortPress = true;
+      }
+      held = false;
+      processed = false;
+    }
+  }
+}
+
+// ── LCD Helpers ────────────────────────────────────────────
+void lcdClear() { lcd.clear(); }
+
+void printCenter(int row, const char* text) {
+  int len = strlen(text);
+  int col = (20 - len) / 2;
+  if (col < 0) col = 0;
+  lcd.setCursor(col, row);
+  lcd.print(text);
+}
+
+void printTime(int row, int col, long secs) {
+  int m = secs / 60;
+  int s = secs % 60;
+  lcd.setCursor(col, row);
+  if (m < 10) lcd.print("0");
+  lcd.print(m);
+  lcd.print(":");
+  if (s < 10) lcd.print("0");
+  lcd.print(s);
+}
+
+// ── Screen Renderers ───────────────────────────────────────
+void drawSplash() {
+  lcdClear();
+  printCenter(1, "StudyMate");
+  printCenter(2, "v1.0");
+}
+
+void drawMainMenu() {
+  lcdClear();
+  lcd.setCursor(0, 0);
+  lcd.print("  Select Mode:      ");
+  lcd.setCursor(0, 1);
+  lcd.print((menuCursor == 0) ? "> " : "  ");
+  lcd.print("Study Session");
+  lcd.setCursor(0, 2);
+  lcd.print((menuCursor == 1) ? "> " : "  ");
+  lcd.print("Exercise Mode");
+  lcd.setCursor(0, 3);
+  lcd.print("A:move  B:select");
+}
+
+void drawSessionSelect() {
+  lcdClear();
+  lcd.setCursor(0, 0);
+  lcd.print("  Choose Duration:  ");
+  const char* labels[] = {"10 minutes", "30 minutes", "60 minutes"};
+  for (int i = 0; i < 3; i++) {
+    lcd.setCursor(0, i + 1);
+    lcd.print((sessionCursor == i) ? "> " : "  ");
+    lcd.print(labels[i]);
+  }
+}
+
+void drawStudyRunning() {
+  long remaining = studyTotalSeconds;
+  lcdClear();
+  lcd.setCursor(0, 0);
+  lcd.print("  Study Session     ");
+  lcd.setCursor(0, 1);
+  lcd.print("  Time Left: ");
+  printTime(1, 13, remaining);
+  lcd.setCursor(0, 2);
+
+  // Progress bar (16 chars wide)
+  long total = sessionOptions[sessionCursor] * 60L;
+  long done  = total - remaining;
+  int  bars  = (int)((done * 16) / total);
+  lcd.print("[");
+  for (int i = 0; i < 16; i++) lcd.print(i < bars ? "#" : "-");
+  lcd.print("]");
+
+  lcd.setCursor(0, 3);
+  if (studyPaused)
+    lcd.print("A:resume  B:back  ");
+  else
+    lcd.print("A:pause   B:back  ");
+}
+
+void drawExerciseRunning() {
+  lcdClear();
+  lcd.setCursor(0, 0);
+  lcd.print("  Exercise Mode     ");
+
+  // Find current exercise
+  int idx = 0;
+  for (int i = 0; i < NUM_EXERCISES; i++) {
+    if (exerciseElapsed >= exercises[i].atSecond) idx = i;
+    else break;
+  }
+  currentExerciseIdx = idx;
+
+  lcd.setCursor(0, 1);
+  // Center exercise name
+  char buf[21];
+  snprintf(buf, 21, "%-20s", exercises[idx].name);
+  printCenter(1, exercises[idx].name);
+
+  // Time remaining
+  long remaining = EXERCISE_TOTAL - exerciseElapsed;
+  lcd.setCursor(0, 2);
+  lcd.print("  Time Left: ");
+  printTime(2, 13, remaining);
+
+  lcd.setCursor(0, 3);
+  if (exercisePaused)
+    lcd.print("A:resume  B:back  ");
+  else
+    lcd.print("A:pause   B:back  ");
+}
+
+void drawDone(bool isExercise) {
+  lcdClear();
+  printCenter(0, isExercise ? "Exercise Done!" : "Session Done!");
+  printCenter(1, "Great Work!");
+  printCenter(2, "B:back to menu");
+}
+
+// ── State Transitions ──────────────────────────────────────
+void goToMainMenu() {
+  appState   = STATE_MAIN_MENU;
+  menuCursor = 0;
+  drawMainMenu();
+}
+
+void startStudySession() {
+  studyTotalSeconds  = sessionOptions[sessionCursor] * 60L;
+  studyRunning       = true;
+  studyPaused        = false;
+  studyPrevMillis    = millis();
+  appState           = STATE_STUDY_RUNNING;
+  drawStudyRunning();
+}
+
+void startExercise() {
+  exerciseElapsed    = 0;
+  exerciseRunning    = true;
+  exercisePaused     = false;
+  exercisePrevMillis = millis();
+  appState           = STATE_EXERCISE_RUNNING;
+  drawExerciseRunning();
+}
+
+// ── Setup ──────────────────────────────────────────────────
 void setup() {
-  Wire.begin(17, 16);  // SDA, SCL
+  Wire.begin(4, 16);  // SDA=4, SCL=16
+  Serial.begin(115200);
 
-  pinMode(BTN_START, INPUT_PULLUP);
-  pinMode(BTN_MODE, INPUT_PULLUP);
+  pinMode(BTN_A, INPUT_PULLUP);
+  pinMode(BTN_B, INPUT_PULLUP);
 
   lcd.init();
   lcd.backlight();
 
-  setModeTimes();
-  displayScreen();
+  splashStart = millis();
+  drawSplash();
 }
 
+// ── Loop ───────────────────────────────────────────────────
 void loop() {
+  bool aShort, aLong, bShort, bLong;
+  handleBtn(BTN_A, btnA_pressTime, btnA_held, btnA_processed, aShort, aLong);
+  handleBtn(BTN_B, btnB_pressTime, btnB_held, btnB_processed, bShort, bLong);
 
-  handleButtons();
+  switch (appState) {
 
-  if (isRunning) {
-    unsigned long currentMillis = millis();
-
-    if (currentMillis - previousMillis >= interval) {
-      previousMillis = currentMillis;
-
-      if (totalSeconds > 0) {
-        totalSeconds--;
-
-        if (isStudy) {
-          xp++;  // Gain XP every study second
-        }
-      } else {
-        switchPhase();
+    // ── SPLASH ──────────────────────────────────────────────
+    case STATE_SPLASH:
+      if (millis() - splashStart >= 3000) {
+        goToMainMenu();
       }
+      break;
 
-      displayScreen();
-    }
+    // ── MAIN MENU ───────────────────────────────────────────
+    case STATE_MAIN_MENU:
+      if (aShort) {
+        menuCursor = (menuCursor + 1) % 2;
+        drawMainMenu();
+      }
+      if (bShort) {
+        if (menuCursor == 0) {
+          // Study session → choose duration
+          sessionCursor = 0;
+          appState = STATE_SESSION_SELECT;
+          drawSessionSelect();
+        } else {
+          // Exercise mode → start immediately
+          startExercise();
+        }
+      }
+      break;
+
+    // ── SESSION SELECT ──────────────────────────────────────
+    case STATE_SESSION_SELECT:
+      if (aShort) {
+        sessionCursor = (sessionCursor + 1) % 3;
+        drawSessionSelect();
+      }
+      if (bShort) {
+        // Select current option → start
+        startStudySession();
+      }
+      if (aLong) {
+        // Long A = go back
+        goToMainMenu();
+      }
+      break;
+
+    // ── STUDY RUNNING ───────────────────────────────────────
+    case STATE_STUDY_RUNNING:
+      if (aShort) {
+        studyPaused = !studyPaused;
+        if (!studyPaused) studyPrevMillis = millis(); // reset timer ref
+        drawStudyRunning();
+      }
+      if (bLong) {
+        studyRunning = false;
+        studyPaused  = false;
+        goToMainMenu();
+      }
+      // Tick
+      if (studyRunning && !studyPaused) {
+        unsigned long now = millis();
+        if (now - studyPrevMillis >= 1000) {
+          studyPrevMillis = now;
+          if (studyTotalSeconds > 0) {
+            studyTotalSeconds--;
+            drawStudyRunning();
+          } else {
+            studyRunning = false;
+            drawDone(false);
+            // Wait for BTN_B to go back
+            appState = STATE_MAIN_MENU; // handled below with done screen
+            // We'll re-use a simple blocking wait approach
+            lcdClear();
+            printCenter(0, "Session Complete!");
+            printCenter(1, "Great Work!");
+            printCenter(2, "B: back to menu");
+            // Wait until B pressed
+            while (true) {
+              if (digitalRead(BTN_B) == LOW) {
+                delay(200);
+                goToMainMenu();
+                break;
+              }
+            }
+          }
+        }
+      }
+      break;
+
+    // ── EXERCISE RUNNING ────────────────────────────────────
+    case STATE_EXERCISE_RUNNING:
+      if (aShort) {
+        exercisePaused = !exercisePaused;
+        if (!exercisePaused) exercisePrevMillis = millis();
+        drawExerciseRunning();
+      }
+      if (bLong) {
+        exerciseRunning = false;
+        exercisePaused  = false;
+        goToMainMenu();
+      }
+      // Tick
+      if (exerciseRunning && !exercisePaused) {
+        unsigned long now = millis();
+        if (now - exercisePrevMillis >= 1000) {
+          exercisePrevMillis = now;
+          if (exerciseElapsed < EXERCISE_TOTAL) {
+            exerciseElapsed++;
+            drawExerciseRunning();
+          } else {
+            exerciseRunning = false;
+            lcdClear();
+            printCenter(0, "Exercise Done!");
+            printCenter(1, "Amazing Work!");
+            printCenter(2, "B: back to menu");
+            while (true) {
+              if (digitalRead(BTN_B) == LOW) {
+                delay(200);
+                goToMainMenu();
+                break;
+              }
+            }
+          }
+        }
+      }
+      break;
   }
-}
-
-void handleButtons() {
-
-  // Start / Pause
-  if (digitalRead(BTN_START) == LOW) {
-    delay(200);
-    isRunning = !isRunning;
-  }
-
-  // Switch Mode (only when paused)
-  if (digitalRead(BTN_MODE) == LOW) {
-    delay(200);
-    if (!isRunning) {
-      if (currentMode == POMODORO)
-        currentMode = DEEP;
-      else
-        currentMode = POMODORO;
-
-      setModeTimes();
-      displayScreen();
-    }
-  }
-}
-
-void setModeTimes() {
-  if (currentMode == POMODORO) {
-    studyMinutes = 25;
-    breakMinutes = 5;
-  } else {
-    studyMinutes = 45;
-    breakMinutes = 10;
-  }
-
-  isStudy = true;
-  totalSeconds = studyMinutes * 60;
-}
-
-void switchPhase() {
-
-  if (isStudy) {
-    isStudy = false;
-    totalSeconds = breakMinutes * 60;
-    streak++;   // Completed one study session
-  } else {
-    isStudy = true;
-    totalSeconds = studyMinutes * 60;
-  }
-}
-
-void displayScreen() {
-
-  lcd.clear();
-
-  // Row 1: Title
-  lcd.setCursor(0, 0);
-  lcd.print("StudyMate");
-
-  // Row 2: Mode
-  lcd.setCursor(0, 1);
-  lcd.print("Mode: ");
-  if (currentMode == POMODORO)
-    lcd.print("Pomodoro");
-  else
-    lcd.print("Deep Study");
-
-  // Row 3: Timer
-  int minutes = totalSeconds / 60;
-  int seconds = totalSeconds % 60;
-
-  lcd.setCursor(0, 2);
-  lcd.print(isStudy ? "Study " : "Break ");
-  lcd.print("Time: ");
-
-  if (minutes < 10) lcd.print("0");
-  lcd.print(minutes);
-  lcd.print(":");
-  if (seconds < 10) lcd.print("0");
-  lcd.print(seconds);
-
-  // Row 4: XP & Streak
-  lcd.setCursor(0, 3);
-  lcd.print("XP:");
-  lcd.print(xp);
-  lcd.print("  Streak:");
-  lcd.print(streak);
 }
