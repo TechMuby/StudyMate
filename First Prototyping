@@ -1,40 +1,29 @@
 /*
   ╔══════════════════════════════════════════════════════════╗
-  ║              StudyMate  Firmware  v5.0                   ║
+  ║              StudyMate  Firmware  v6.0                   ║
   ║     ESP32 + I2C 20x4 LCD + DS3231 OR ESP32 Hotspot       ║
   ╠══════════════════════════════════════════════════════════╣
   ║  WIRING                                                  ║
-  ║  LCD  SDA -> GPIO 4    SCL -> GPIO 16                    ║
-  ║  RTC  SDA -> GPIO 4    SCL -> GPIO 16  (optional)        ║
-  ║  BTN_A -> GPIO 27                                        ║
-  ║  BTN_B -> GPIO 26   (long press = back/quit)             ║
+  ║  LCD    SDA -> GPIO 4    SCL -> GPIO 16                  ║
+  ║  RTC    SDA -> GPIO 4    SCL -> GPIO 16  (optional)      ║
+  ║  BTN_A  -> GPIO 27                                       ║
+  ║  BTN_B  -> GPIO 26   (long press = back / quit)          ║
+  ║  BUZZER -> GPIO 19   (passive buzzer)                    ║
   ╠══════════════════════════════════════════════════════════╣
   ║  LIBRARIES  (Arduino Library Manager)                    ║
   ║  - LiquidCrystal I2C  by Frank de Brabander              ║
   ║  - RTClib              by Adafruit                       ║
+  ║  (WiFi, WebServer, Preferences — built into ESP32 core)  ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  v6 NEW: SETUP PORTAL                                    ║
+  ║  "Settings" added to main menu → starts hotspot          ║
+  ║  Connect to StudyMate-Setup → open 192.168.4.1           ║
+  ║  Portal lets you:                                        ║
+  ║   • Edit all exercise names + durations (seconds)        ║
+  ║   • Edit the 3 study session durations (minutes)         ║
+  ║   • Reset everything to factory defaults                 ║
+  ║  Config saved to flash (Preferences) — survives reboot   ║
   ╚══════════════════════════════════════════════════════════╝
-
-  ── CUSTOM CHARACTER SLOTS ────────────────────────────────────
-  The HD44780 LCD has 8 user-definable 5x8 pixel characters.
-  Slots 0-4 are loaded at boot and never change.
-  Slots 5-7 are hot-swapped per screen for the hint row icons.
-
-  Permanent (boot):
-    #0  ██  Solid bar  — progress fill
-    #1  □   Outline bar — progress empty
-    #2  ▶   Play arrow  — running state / menu cursor
-    #3  ⏸   Pause bars  — paused state
-    #4  ♥   Heart       — splash & done screens
-
-  Hot-swapped into slots 5-7 before each hint row draw:
-    ↕   Up-down scroll  (menus: A scrolls)
-    ↓   Down / cycle    (session select: A cycles down)
-    ↵   Enter/confirm   (B selects/starts)
-    ←   Back arrow      (B long = go back)
-    ⌂   Home icon       (B long = go home on timers)
-    ♪   Music note      (exercise header)
-    ✓   Checkmark       (sync done)
-    ⊙   Clock face      (home screen header)
 */
 
 // ── Includes ────────────────────────────────────────────────
@@ -44,357 +33,556 @@
 #include <RTClib.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 
-// ── Config ──────────────────────────────────────────────────
-#define AP_SSID  "StudyMate-Setup"
-#define AP_PASS  ""
-#define BTN_A    27
-#define BTN_B    26
+// ── Configuration ───────────────────────────────────────────
+#define AP_SSID     "StudyMate-Setup"
+#define AP_PASS     ""
+#define BTN_A       27
+#define BTN_B       26
+#define BUZZER_PIN  19
+#define MAX_EXERCISES 20
+#define MAX_NAME_LEN  20
 
-// ── Hardware objects ────────────────────────────────────────
+// ── Global objects ──────────────────────────────────────────
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 RTC_DS3231        rtc;
 WebServer         server(80);
+Preferences       prefs;
+
 
 // ════════════════════════════════════════════════════════════
-//  CUSTOM CHARACTER BITMAPS
+//  RUNTIME CONFIG  (loaded from flash, edited via portal)
 // ════════════════════════════════════════════════════════════
+struct ExerciseMove {
+  char name[MAX_NAME_LEN + 1];
+  int  durationSec;   // how long this exercise lasts
+};
 
-// ── Permanent slots 0-4 ─────────────────────────────────────
-byte charSolid[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F}; // #0 ██ bar fill
-byte charHollow[8]= {0x1F,0x11,0x11,0x11,0x11,0x11,0x11,0x1F}; // #1 □  bar empty
-byte charPlay[8]  = {0x08,0x0C,0x0E,0x0F,0x0E,0x0C,0x08,0x00}; // #2 ▶  play
-byte charPause[8] = {0x1B,0x1B,0x1B,0x1B,0x1B,0x1B,0x1B,0x00}; // #3 ⏸  pause
-byte charHeart[8] = {0x00,0x0A,0x1F,0x1F,0x0E,0x04,0x00,0x00}; // #4 ♥  heart
+// Working copies — modified by portal, persisted to flash
+int           numExercises = 0;
+ExerciseMove  exList[MAX_EXERCISES];
+int           sessionMins[3];   // e.g. {10, 30, 60}
 
-// ── Hot-swap icons for hint row (loaded into slots 5-7) ─────
-byte icnUpDn[8]  = {0x04,0x0E,0x1F,0x00,0x1F,0x0E,0x04,0x00}; // ↕  scroll
-byte icnDown[8]  = {0x04,0x04,0x04,0x04,0x1F,0x0E,0x04,0x00}; // ↓  cycle down
-byte icnEnter[8] = {0x01,0x01,0x05,0x09,0x1F,0x08,0x04,0x00}; // ↵  confirm
-byte icnBack[8]  = {0x04,0x08,0x1F,0x08,0x04,0x00,0x00,0x00}; // ←  back
-byte icnHome[8]  = {0x04,0x0E,0x1F,0x11,0x11,0x1F,0x00,0x00}; // ⌂  home
-byte icnNote[8]  = {0x01,0x03,0x05,0x09,0x1B,0x1B,0x12,0x00}; // ♪  music
-byte icnCheck[8] = {0x00,0x01,0x01,0x02,0x14,0x08,0x00,0x00}; // ✓  check
-byte icnClock[8] = {0x0E,0x11,0x15,0x17,0x11,0x0E,0x00,0x00}; // ⊙  clock
+// Computed from exList — atSecond[i] = when exercise i starts
+int atSecond[MAX_EXERCISES];
 
-// Load permanent chars at boot
-void loadPermanentChars() {
-  lcd.createChar(0, charSolid);
-  lcd.createChar(1, charHollow);
-  lcd.createChar(2, charPlay);
-  lcd.createChar(3, charPause);
-  lcd.createChar(4, charHeart);
+void computeStartTimes() {
+  int t = 0;
+  for (int i = 0; i < numExercises; i++) {
+    atSecond[i] = t;
+    t += exList[i].durationSec;
+  }
 }
 
-// ── Slot helpers — call before drawing the relevant screen ──
-// After lcd.createChar() you MUST do lcd.setCursor() or lcd.home()
-// before writing, otherwise the cursor stays in CGRAM mode.
+int totalExerciseSec() {
+  int t = 0;
+  for (int i = 0; i < numExercises; i++) t += exList[i].durationSec;
+  return t;
+}
 
-// Menu screens: [↕]A  [↵]B  [←]B-long
+// ── Factory defaults ─────────────────────────────────────────
+void loadDefaults() {
+  sessionMins[0] = 10;
+  sessionMins[1] = 30;
+  sessionMins[2] = 60;
+
+  const char* dNames[] = {
+    "Get Ready!","Jack Squats","Push-Ups","Caterpillars",
+    "Inch Worms","Elbow Plank","Cat Stretch","Wats Up Dawg",
+    "Heel Tap Crunch","Hip Thrust","Squat+Calf Raise",
+    "Eagle Walks","Upright Plank","Hamstring Stretch",
+    "Superman Strokes","Neg. Push-Ups","Hip Stretch Lunge",
+    "Squat Taps","Jumping Jacks"
+  };
+  const int dDur[] = {
+    27,30,30,30,30,30,30,30,30,30,
+    60,30,30,60,30,30,30,30,30
+  };
+  numExercises = 19;
+  for (int i = 0; i < numExercises; i++) {
+    strncpy(exList[i].name, dNames[i], MAX_NAME_LEN);
+    exList[i].name[MAX_NAME_LEN] = '\0';
+    exList[i].durationSec = dDur[i];
+  }
+  computeStartTimes();
+}
+
+// ── Flash persistence ────────────────────────────────────────
+void saveConfig() {
+  prefs.begin("studymate", false);
+  prefs.putInt("numEx", numExercises);
+  for (int i = 0; i < numExercises; i++) {
+    char kName[12], kDur[12];
+    snprintf(kName, 12, "exN%d", i);
+    snprintf(kDur,  12, "exD%d", i);
+    prefs.putString(kName, exList[i].name);
+    prefs.putInt(kDur, exList[i].durationSec);
+  }
+  prefs.putInt("s0", sessionMins[0]);
+  prefs.putInt("s1", sessionMins[1]);
+  prefs.putInt("s2", sessionMins[2]);
+  prefs.end();
+}
+
+void loadConfig() {
+  prefs.begin("studymate", true);
+  int n = prefs.getInt("numEx", -1);
+  if (n < 1 || n > MAX_EXERCISES) {
+    prefs.end();
+    loadDefaults();
+    return;
+  }
+  numExercises = n;
+  for (int i = 0; i < numExercises; i++) {
+    char kName[12], kDur[12];
+    snprintf(kName, 12, "exN%d", i);
+    snprintf(kDur,  12, "exD%d", i);
+    String s = prefs.getString(kName, "Exercise");
+    strncpy(exList[i].name, s.c_str(), MAX_NAME_LEN);
+    exList[i].name[MAX_NAME_LEN] = '\0';
+    exList[i].durationSec = prefs.getInt(kDur, 30);
+  }
+  sessionMins[0] = prefs.getInt("s0", 10);
+  sessionMins[1] = prefs.getInt("s1", 30);
+  sessionMins[2] = prefs.getInt("s2", 60);
+  prefs.end();
+  computeStartTimes();
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  CGRAM BITMAPS
+// ════════════════════════════════════════════════════════════
+byte segTF[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
+byte segTT[8] = {0x1F,0x1F,0x1F,0x1F,0x00,0x00,0x00,0x00};
+byte segTB[8] = {0x00,0x00,0x00,0x00,0x1F,0x1F,0x1F,0x1F};
+byte segBF[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
+byte segBT[8] = {0x1F,0x1F,0x1F,0x1F,0x00,0x00,0x00,0x00};
+byte segBB[8] = {0x00,0x00,0x00,0x00,0x1F,0x1F,0x1F,0x1F};
+byte segSP[8] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+byte segHT[8] = {0x00,0x0A,0x1F,0x1F,0x0E,0x04,0x00,0x00};
+
+byte icnPlay[8]  = {0x08,0x0C,0x0E,0x0F,0x0E,0x0C,0x08,0x00};
+byte icnPause[8] = {0x1B,0x1B,0x1B,0x1B,0x1B,0x1B,0x1B,0x00};
+byte icnSolid[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
+byte icnHollow[8]= {0x1F,0x11,0x11,0x11,0x11,0x11,0x11,0x1F};
+byte icnUpDn[8]  = {0x04,0x0E,0x1F,0x00,0x1F,0x0E,0x04,0x00};
+byte icnDown[8]  = {0x04,0x04,0x04,0x04,0x1F,0x0E,0x04,0x00};
+byte icnEnter[8] = {0x01,0x01,0x05,0x09,0x1F,0x08,0x04,0x00};
+byte icnBack[8]  = {0x04,0x08,0x1F,0x08,0x04,0x00,0x00,0x00};
+byte icnNote[8]  = {0x01,0x03,0x05,0x09,0x1B,0x1B,0x12,0x00};
+byte icnCheck[8] = {0x00,0x01,0x01,0x02,0x14,0x08,0x00,0x00};
+
+void slots_BigDigits() {
+  lcd.createChar(0,segTF); lcd.createChar(1,segTT); lcd.createChar(2,segTB);
+  lcd.createChar(3,segBF); lcd.createChar(4,segBT); lcd.createChar(5,segBB);
+  lcd.createChar(6,segSP); lcd.createChar(7,segHT); lcd.home();
+}
 void slots_Menu() {
-  lcd.createChar(5, icnUpDn);
-  lcd.createChar(6, icnEnter);
-  lcd.createChar(7, icnBack);
-  lcd.home();
+  lcd.createChar(0,icnSolid);  lcd.createChar(1,icnHollow); lcd.createChar(2,icnPlay);
+  lcd.createChar(3,icnPause);  lcd.createChar(4,segHT);     lcd.createChar(5,icnUpDn);
+  lcd.createChar(6,icnEnter);  lcd.createChar(7,icnBack);   lcd.home();
 }
-
-// Session select: [↓]A  [↵]B  [←]B-long
 void slots_Session() {
-  lcd.createChar(5, icnDown);
-  lcd.createChar(6, icnEnter);
-  lcd.createChar(7, icnBack);
+  lcd.createChar(1,icnHollow); lcd.createChar(2,icnPlay);
+  lcd.createChar(5,icnDown);   lcd.createChar(6,icnEnter); lcd.createChar(7,icnBack);
   lcd.home();
 }
-
-// Timer screens (study/exercise): [▶/⏸]A  [⌂]B-long
-// (▶ = slot2, ⏸ = slot3 already permanent — only need ⌂)
-void slots_Timer() {
-  lcd.createChar(7, icnHome);
-  lcd.home();
-}
-
-// Home clock screen: ⊙ clock header
-void slots_Home() {
-  lcd.createChar(5, icnClock);
-  lcd.home();
-}
-
-// Sync screens: ♪ note, ✓ check
 void slots_Sync() {
-  lcd.createChar(5, icnNote);
-  lcd.createChar(6, icnCheck);
-  lcd.home();
+  lcd.createChar(4,segHT);    lcd.createChar(5,icnNote);
+  lcd.createChar(6,icnCheck); lcd.createChar(7,icnBack); lcd.home();
+}
+void slots_Done() { lcd.createChar(4,segHT); lcd.home(); }
+
+
+// ════════════════════════════════════════════════════════════
+//  BIG DIGIT RENDERER
+// ════════════════════════════════════════════════════════════
+const uint8_t DIGITS[10][6] = {
+  {0,1,0, 3,5,3}, {6,0,6, 6,3,6}, {2,1,0, 3,5,6}, {1,1,0, 5,5,3},
+  {0,2,0, 6,6,3}, {0,1,2, 5,5,3}, {0,1,2, 3,5,3}, {1,1,0, 6,4,6},
+  {0,1,0, 3,5,3}, {0,1,0, 5,5,3},
+};
+
+void drawBigDigit(int d, int col, int topRow) {
+  if (d<0||d>9) d=0;
+  lcd.setCursor(col,   topRow);   lcd.write(DIGITS[d][0]);
+  lcd.setCursor(col+1, topRow);   lcd.write(DIGITS[d][1]);
+  lcd.setCursor(col+2, topRow);   lcd.write(DIGITS[d][2]);
+  lcd.setCursor(col,   topRow+1); lcd.write(DIGITS[d][3]);
+  lcd.setCursor(col+1, topRow+1); lcd.write(DIGITS[d][4]);
+  lcd.setCursor(col+2, topRow+1); lcd.write(DIGITS[d][5]);
 }
 
-// Exercise header: ♪ note
-void slots_Exercise() {
-  lcd.createChar(5, icnNote);
-  lcd.createChar(7, icnHome);
-  lcd.home();
+void drawBigTime(int left, int right, int topRow) {
+  drawBigDigit(left/10,  1, topRow);
+  drawBigDigit(left%10,  5, topRow);
+  lcd.setCursor(9, topRow);   lcd.print(".");
+  lcd.setCursor(9, topRow+1); lcd.print(".");
+  drawBigDigit(right/10, 11, topRow);
+  drawBigDigit(right%10, 15, topRow);
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  BUZZER
-//  Passive buzzer on GPIO 19.
-//  All sounds are non-blocking except the boot melody and
-//  the exercise-change chime, which are short enough (~300ms)
-//  that they don't affect UX.
 // ════════════════════════════════════════════════════════════
-#define BUZZER_PIN 19
+#define NOTE_C4 262
+#define NOTE_E4 330
+#define NOTE_G4 392
+#define NOTE_A4 440
+#define NOTE_C5 523
+#define NOTE_E5 659
+#define NOTE_G5 784
+#define NOTE_A5 880
 
-// ── Low-level tone helpers ──────────────────────────────────
-// Play a single note: frequency in Hz, duration in ms.
-// freq = 0 → silence (rest).
-void buzzNote(int freq, int dur) {
-  if (freq > 0) {
-    tone(BUZZER_PIN, freq, dur);
-  } else {
-    noTone(BUZZER_PIN);
-  }
-  delay(dur);
+void buzzNoteGap(int freq, int dur, int gap=30) {
+  if (freq>0) tone(BUZZER_PIN,freq,dur); else noTone(BUZZER_PIN);
+  delay(dur); noTone(BUZZER_PIN); delay(gap);
+}
+void sfx_ButtonClick()    { tone(BUZZER_PIN,1800,18); }
+void sfx_Navigate()       { tone(BUZZER_PIN,1200,25); }
+void sfx_Confirm()        { buzzNoteGap(NOTE_E5,60,20); buzzNoteGap(NOTE_G5,80,0); }
+void sfx_Back()           { buzzNoteGap(NOTE_G4,60,20); buzzNoteGap(NOTE_E4,80,0); }
+void sfx_Pause()          { tone(BUZZER_PIN,400,120); }
+void sfx_Resume()         { tone(BUZZER_PIN,NOTE_A5,80); }
+void sfx_Saved()          { buzzNoteGap(NOTE_C5,80,15); buzzNoteGap(NOTE_E5,80,15); buzzNoteGap(NOTE_C5,160,0); }
+void sfx_ExerciseChange() { buzzNoteGap(NOTE_C5,70,25); buzzNoteGap(NOTE_E5,70,25); buzzNoteGap(NOTE_G5,110,0); }
+void sfx_Done()           { buzzNoteGap(NOTE_C5,100,20); buzzNoteGap(NOTE_E5,100,20); buzzNoteGap(NOTE_G5,100,20); buzzNoteGap(NOTE_C5,250,0); }
+void sfx_BootMelody()     {
+  buzzNoteGap(NOTE_C4,160,40); buzzNoteGap(NOTE_E4,160,40);
+  buzzNoteGap(NOTE_G4,160,40); buzzNoteGap(NOTE_C5,280,60);
+  buzzNoteGap(NOTE_G4,130,30); buzzNoteGap(NOTE_A4,130,30);
+  buzzNoteGap(NOTE_G4,130,30); buzzNoteGap(NOTE_E4,130,30);
+  buzzNoteGap(NOTE_C4,260,0);
 }
 
-// Same as buzzNote but adds a small gap after so notes
-// don't bleed into each other (legato vs staccato feel).
-void buzzNoteGap(int freq, int dur, int gap = 30) {
-  buzzNote(freq, dur);
-  noTone(BUZZER_PIN);
-  delay(gap);
-}
-
-// ── Note frequency constants ────────────────────────────────
-#define NOTE_C4  262
-#define NOTE_D4  294
-#define NOTE_E4  330
-#define NOTE_F4  349
-#define NOTE_G4  392
-#define NOTE_A4  440
-#define NOTE_B4  494
-#define NOTE_C5  523
-#define NOTE_D5  587
-#define NOTE_E5  659
-#define NOTE_F5  698
-#define NOTE_G5  784
-#define NOTE_A5  880
-#define NOTE_REST  0
-
-// ════════════════════════════════════════════════════════════
-//  SOUND EFFECTS
-// ════════════════════════════════════════════════════════════
-
-// ── 1. Button click — short, snappy, non-intrusive ──────────
-//  A crisp 2ms tick at 1800Hz. Barely audible but tactile.
-void sfx_ButtonClick() {
-  tone(BUZZER_PIN, 1800, 18);
-  // No delay — returns immediately so UI stays responsive.
-  // The tone() call handles the timing in the background.
-}
-
-// ── 2. Navigate / scroll — slightly lower than click ────────
-//  Used when cursor moves between menu items.
-void sfx_Navigate() {
-  tone(BUZZER_PIN, 1200, 25);
-}
-
-// ── 3. Confirm / select — two-note ascending pop ────────────
-//  Used when an option is confirmed (B press to start/select).
-void sfx_Confirm() {
-  buzzNoteGap(NOTE_E5, 60, 20);
-  buzzNoteGap(NOTE_G5, 80, 0);
-}
-
-// ── 4. Back / cancel — descending two-note ──────────────────
-void sfx_Back() {
-  buzzNoteGap(NOTE_G4, 60, 20);
-  buzzNoteGap(NOTE_E4, 80, 0);
-}
-
-// ── 5. Pause — single dull thud ─────────────────────────────
-void sfx_Pause() {
-  tone(BUZZER_PIN, 400, 120);
-}
-
-// ── 6. Resume — bright single note ──────────────────────────
-void sfx_Resume() {
-  tone(BUZZER_PIN, NOTE_A5, 80);
-}
-
-// ── 7. Exercise change chime ─────────────────────────────────
-//  A short 3-note ascending chime. Signals next move.
-//  Total duration ~270ms — fast enough to not feel intrusive.
-void sfx_ExerciseChange() {
-  buzzNoteGap(NOTE_C5, 70, 25);
-  buzzNoteGap(NOTE_E5, 70, 25);
-  buzzNoteGap(NOTE_G5, 110, 0);
-}
-
-// ── 8. Session / exercise complete ───────────────────────────
-//  Triumphant 4-note fanfare.
-void sfx_Done() {
-  buzzNoteGap(NOTE_C5, 100, 20);
-  buzzNoteGap(NOTE_E5, 100, 20);
-  buzzNoteGap(NOTE_G5, 100, 20);
-  buzzNoteGap(NOTE_C5, 250, 0);  // high C hold
-}
-
-// ── 9. Boot melody ────────────────────────────────────────────
-//  Plays during the 3-second splash screen.
-//  A cheerful 8-note tune that feels welcoming.
-//  Uses the full 3s window (notes + gaps ≈ 2.8s total).
-void sfx_BootMelody() {
-  // "Do Re Mi" ascending flourish → resolve
-  //  C4  E4  G4  C5  |  G4  A4  G4  |  E4  C4
-  buzzNoteGap(NOTE_C4, 160, 40);
-  buzzNoteGap(NOTE_E4, 160, 40);
-  buzzNoteGap(NOTE_G4, 160, 40);
-  buzzNoteGap(NOTE_C5, 280, 60);   // peak — held longer
-  buzzNoteGap(NOTE_G4, 130, 30);
-  buzzNoteGap(NOTE_A4, 130, 30);
-  buzzNoteGap(NOTE_G4, 130, 30);
-  buzzNoteGap(NOTE_E4, 130, 30);
-  buzzNoteGap(NOTE_C4, 260, 0);   // landing note
-  // Total ≈ 160+40 +160+40 +160+40 +280+60 +130+30*4 +260 = ~1780ms
-  // Leaves ~1.2s of silence before splash clears — feels natural.
-}
 
 // ════════════════════════════════════════════════════════════
 //  TIME SOURCE
 // ════════════════════════════════════════════════════════════
 enum TimeSource { TS_NONE, TS_RTC, TS_SOFTWARE };
 TimeSource timeSource = TS_NONE;
-
 time_t   swEpoch  = 0;
 uint32_t swMillis = 0;
 
 time_t nowEpoch() {
-  if (timeSource == TS_RTC) return (time_t)rtc.now().unixtime();
-  return swEpoch + (time_t)((millis() - swMillis) / 1000UL);
+  if (timeSource==TS_RTC) return (time_t)rtc.now().unixtime();
+  return swEpoch + (time_t)((millis()-swMillis)/1000UL);
 }
 
-uint16_t ct_year;
-uint8_t  ct_month, ct_day, ct_hour, ct_minute, ct_second, ct_dow;
-
+uint16_t ct_year; uint8_t ct_month,ct_day,ct_hour,ct_minute,ct_second,ct_dow;
 void decodeEpoch(time_t ep) {
-  struct tm t;
-  gmtime_r(&ep, &t);
-  ct_year   = (uint16_t)(t.tm_year + 1900);
-  ct_month  = (uint8_t)(t.tm_mon  + 1);
-  ct_day    = (uint8_t)t.tm_mday;
-  ct_hour   = (uint8_t)t.tm_hour;
-  ct_minute = (uint8_t)t.tm_min;
-  ct_second = (uint8_t)t.tm_sec;
-  ct_dow    = (uint8_t)t.tm_wday;
+  struct tm t; gmtime_r(&ep,&t);
+  ct_year=(uint16_t)(t.tm_year+1900); ct_month=(uint8_t)(t.tm_mon+1);
+  ct_day=(uint8_t)t.tm_mday; ct_hour=(uint8_t)t.tm_hour;
+  ct_minute=(uint8_t)t.tm_min; ct_second=(uint8_t)t.tm_sec; ct_dow=(uint8_t)t.tm_wday;
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  APP STATES
 // ════════════════════════════════════════════════════════════
 enum AppState {
-  STATE_SPLASH,
-  STATE_TIME_SYNC_AP,
-  STATE_HOME_CLOCK,
-  STATE_MAIN_MENU,
-  STATE_SESSION_SELECT,
-  STATE_STUDY_RUNNING,
-  STATE_EXERCISE_RUNNING,
-  STATE_DONE
+  STATE_SPLASH, STATE_TIME_SYNC_AP, STATE_HOME_CLOCK,
+  STATE_MAIN_MENU, STATE_SESSION_SELECT,
+  STATE_STUDY_RUNNING, STATE_EXERCISE_RUNNING,
+  STATE_SETUP_AP, STATE_DONE
 };
 AppState appState = STATE_SPLASH;
 
-unsigned long splashStart     = 0;
 unsigned long lastClockUpdate = 0;
 bool          timeSynced      = false;
-
-int menuCursor    = 0;
-int sessionCursor = 0;
-const int sessionOptions[] = {10, 30, 60};
+bool          setupSaved      = false;
+int           menuCursor      = 0;  // 0=Study 1=Exercise 2=Settings
+int           sessionCursor   = 0;
 
 long          studyTotalSeconds = 0;
-bool          studyRunning      = false;
-bool          studyPaused       = false;
-unsigned long studyPrevMillis   = 0;
+bool          studyRunning=false, studyPaused=false;
+unsigned long studyPrevMillis=0;
 
-struct ExerciseMove { int atSecond; const char* name; };
-const ExerciseMove exercises[] = {
-  {0,   "Get Ready!"},
-  {27,  "Jack Squats"},
-  {57,  "Push-Ups"},
-  {87,  "Caterpillars"},
-  {117, "Inch Worms"},
-  {147, "Elbow Plank"},
-  {177, "Cat Stretch"},
-  {207, "Wats Up Dawg"},
-  {237, "Heel Tap Crunch"},
-  {267, "Hip Thrust"},
-  {297, "Squat+Calf Raise"},
-  {357, "Eagle Walks"},
-  {387, "Upright Plank"},
-  {417, "Hamstring Stretch"},
-  {477, "Superman Strokes"},
-  {507, "Neg. Push-Ups"},
-  {537, "Hip Stretch Lunge"},
-  {567, "Squat Taps"},
-  {597, "Jumping Jacks"}
-};
-const int NUM_EXERCISES  = sizeof(exercises) / sizeof(exercises[0]);
-const int EXERCISE_TOTAL = 600;
+long          exerciseElapsed=0;
+bool          exerciseRunning=false, exercisePaused=false, doneIsExercise=false;
+unsigned long exercisePrevMillis=0;
 
-long          exerciseElapsed    = 0;
-bool          exerciseRunning    = false;
-bool          exercisePaused     = false;
-unsigned long exercisePrevMillis = 0;
-bool          doneIsExercise     = false;
 
 // ════════════════════════════════════════════════════════════
 //  BUTTONS
 // ════════════════════════════════════════════════════════════
-unsigned long btnA_pt = 0, btnB_pt = 0;
-bool btnA_held=false, btnB_held=false, btnA_proc=false, btnB_proc=false;
-const unsigned long LONG_PRESS = 700;
-const unsigned long DEBOUNCE   = 50;
+unsigned long btnA_pt=0,btnB_pt=0;
+bool btnA_held=false,btnB_held=false,btnA_proc=false,btnB_proc=false;
+const unsigned long LONG_PRESS=700, DEBOUNCE=50;
 
-void handleBtn(int pin, unsigned long &pt, bool &held, bool &proc,
-               bool &sOut, bool &lOut) {
-  sOut = false; lOut = false;
-  if (digitalRead(pin) == LOW) {
-    if (!held) { held=true; proc=false; pt=millis(); }
-    else if (!proc && millis()-pt >= LONG_PRESS) { lOut=true; proc=true; }
+void handleBtn(int pin,unsigned long &pt,bool &held,bool &proc,bool &sOut,bool &lOut){
+  sOut=false; lOut=false;
+  if(digitalRead(pin)==LOW){
+    if(!held){held=true;proc=false;pt=millis();}
+    else if(!proc&&millis()-pt>=LONG_PRESS){lOut=true;proc=true;}
   } else {
-    if (held) {
-      if (!proc && millis()-pt >= DEBOUNCE) sOut=true;
-      held=false; proc=false;
-    }
+    if(held){if(!proc&&millis()-pt>=DEBOUNCE)sOut=true; held=false;proc=false;}
   }
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  LCD UTILITIES
 // ════════════════════════════════════════════════════════════
-void printCenter(int row, const char* txt) {
-  int len = (int)strlen(txt);
-  int col = (20 - len) / 2;
-  if (col < 0) col = 0;
-  lcd.setCursor(col, row);
-  lcd.print(txt);
+void printCenter(int row,const char* txt){
+  int len=(int)strlen(txt),col=(20-len)/2;
+  if(col<0)col=0; lcd.setCursor(col,row); lcd.print(txt);
 }
+const char* DOW_N[]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+const char* MON_N[]={"","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+uint8_t to12h(uint8_t h){return (h==0)?12:(h>12?h-12:h);}
+const char* ampmStr(uint8_t h){return (h<12)?"AM":"PM";}
 
-void pad2(int v) { if (v < 10) lcd.print("0"); lcd.print(v); }
-
-void printCountdown(int row, int col, long secs) {
-  lcd.setCursor(col, row);
-  pad2((int)(secs/60)); lcd.print(":"); pad2((int)(secs%60));
-}
-
-const char* DOW_N[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-const char* MON_N[] = {"","Jan","Feb","Mar","Apr","May","Jun",
-                        "Jul","Aug","Sep","Oct","Nov","Dec"};
-uint8_t to12h(uint8_t h) { return (h==0)?12:(h>12?h-12:h); }
-const char* ampmStr(uint8_t h) { return (h<12)?"AM":"PM"; }
 
 // ════════════════════════════════════════════════════════════
-//  WEB PAGE
+//  SETUP PORTAL HTML
+//  Served at 192.168.4.1/setup
+//  Single-page app — loads current config via /config.json,
+//  renders editable form, posts changes to /save
 // ════════════════════════════════════════════════════════════
-const char HTML_PAGE[] PROGMEM = R"rawhtml(
+const char SETUP_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StudyMate Setup</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#0a0a0f;color:#e8e8f0;min-height:100vh;padding:0 0 60px}
+header{background:#111128;border-bottom:1px solid #222244;padding:18px 20px;
+       display:flex;align-items:center;gap:12px}
+header h1{font-size:1.3rem;font-weight:700;color:#fff}
+header span{font-size:.8rem;color:#6668aa;background:#1a1a3a;
+            border:1px solid #333366;border-radius:20px;padding:3px 10px}
+.container{max-width:600px;margin:0 auto;padding:24px 16px}
+.section{background:#111128;border:1px solid #1e1e40;border-radius:14px;
+         margin-bottom:20px;overflow:hidden}
+.section-header{padding:14px 18px;background:#161635;border-bottom:1px solid #1e1e40;
+                display:flex;justify-content:space-between;align-items:center}
+.section-header h2{font-size:.95rem;font-weight:600;color:#9090d0}
+.section-header .badge{font-size:.72rem;background:#0d0d2a;color:#6668aa;
+                       border:1px solid #2a2a55;border-radius:12px;padding:2px 8px}
+.sessions{display:flex;gap:12px;padding:18px}
+.sess-item{flex:1;display:flex;flex-direction:column;gap:6px}
+.sess-item label{font-size:.72rem;color:#8888aa;text-transform:uppercase;letter-spacing:.06em}
+.sess-item input{background:#0d0d22;border:1px solid #2a2a55;border-radius:8px;
+                 color:#fff;font-size:1.1rem;font-weight:600;padding:10px;
+                 text-align:center;width:100%;outline:none}
+.sess-item input:focus{border-color:#5555cc}
+.sess-unit{font-size:.7rem;color:#6668aa;text-align:center;margin-top:2px}
+.ex-list{padding:0}
+.ex-row{display:grid;grid-template-columns:24px 1fr 80px 36px;align-items:center;
+        gap:8px;padding:10px 16px;border-bottom:1px solid #1a1a38}
+.ex-row:last-child{border-bottom:none}
+.ex-num{font-size:.72rem;color:#4444aa;font-weight:700;text-align:center}
+.ex-row input[type=text]{background:#0d0d22;border:1px solid #22224a;
+                         border-radius:7px;color:#e0e0ff;font-size:.9rem;
+                         padding:7px 10px;width:100%;outline:none}
+.ex-row input[type=text]:focus{border-color:#5555cc}
+.dur-wrap{display:flex;align-items:center;gap:4px}
+.dur-wrap input[type=number]{background:#0d0d22;border:1px solid #22224a;
+                              border-radius:7px;color:#7adfaa;font-size:.9rem;
+                              font-weight:600;padding:7px 6px;width:52px;
+                              text-align:center;outline:none}
+.dur-wrap input[type=number]:focus{border-color:#5555cc}
+.dur-wrap span{font-size:.7rem;color:#5566aa}
+.del-btn{background:none;border:1px solid #331122;border-radius:6px;
+         color:#885566;font-size:.85rem;cursor:pointer;padding:5px 8px;
+         line-height:1;transition:all .15s}
+.del-btn:hover{background:#220011;border-color:#aa2244;color:#ff4466}
+.add-btn{display:flex;align-items:center;gap:8px;margin:12px 16px;
+         background:#0d1a22;border:1px dashed #224433;border-radius:9px;
+         color:#448866;font-size:.85rem;padding:10px 14px;cursor:pointer;
+         width:calc(100% - 32px);justify-content:center;transition:all .15s}
+.add-btn:hover{background:#0d2218;border-color:#336644;color:#66cc99}
+.footer{position:fixed;bottom:0;left:0;right:0;background:#0d0d20;
+        border-top:1px solid #1e1e40;padding:12px 16px;
+        display:flex;gap:10px;max-width:600px;margin:0 auto}
+.btn-save{flex:1;background:#2233aa;border:none;border-radius:10px;
+          color:#fff;font-size:.95rem;font-weight:700;padding:13px;
+          cursor:pointer;transition:background .15s}
+.btn-save:hover{background:#3344cc}
+.btn-save:disabled{background:#222244;color:#555577}
+.btn-reset{background:#1a0d0d;border:1px solid #331111;border-radius:10px;
+           color:#774444;font-size:.85rem;padding:13px 16px;cursor:pointer;
+           transition:all .15s;white-space:nowrap}
+.btn-reset:hover{background:#220000;border-color:#662222;color:#ff6666}
+.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%) translateY(-80px);
+       background:#0d2e1a;border:1px solid #1d6040;border-radius:12px;
+       padding:12px 22px;color:#4ddd90;font-weight:600;font-size:.9rem;
+       transition:transform .3s;z-index:999;white-space:nowrap}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.total-time{padding:8px 18px 12px;font-size:.75rem;color:#5566aa}
+.total-time span{color:#8899cc;font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9881; StudyMate Setup</h1>
+  <span>192.168.4.1</span>
+</header>
+<div class="container">
+  <div class="section">
+    <div class="section-header">
+      <h2>Study Session Durations</h2>
+      <span class="badge">minutes</span>
+    </div>
+    <div class="sessions">
+      <div class="sess-item">
+        <label>Option 1</label>
+        <input type="number" id="s0" min="1" max="180">
+        <div class="sess-unit">min</div>
+      </div>
+      <div class="sess-item">
+        <label>Option 2</label>
+        <input type="number" id="s1" min="1" max="180">
+        <div class="sess-unit">min</div>
+      </div>
+      <div class="sess-item">
+        <label>Option 3</label>
+        <input type="number" id="s2" min="1" max="180">
+        <div class="sess-unit">min</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <h2>Exercise Routine</h2>
+      <span class="badge" id="totalBadge">-- total</span>
+    </div>
+    <div class="ex-list" id="exList"></div>
+    <button class="add-btn" onclick="addExercise()">+ Add Exercise</button>
+    <div class="total-time" id="totalTime"></div>
+  </div>
+</div>
+
+<div class="footer">
+  <button class="btn-reset" onclick="resetDefaults()">&#8635; Reset</button>
+  <button class="btn-save" id="saveBtn" onclick="saveAll()">Save to Device</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+var exercises = [];
+
+function showToast(msg, ok) {
+  var t = document.getElementById('toast');
+  t.textContent = (ok ? '✓ ' : '⚠ ') + msg;
+  t.style.background = ok ? '#0d2e1a' : '#2e1a0d';
+  t.style.color = ok ? '#4ddd90' : '#ffaa44';
+  t.style.borderColor = ok ? '#1d6040' : '#604020';
+  t.classList.add('show');
+  setTimeout(function(){t.classList.remove('show');}, 2500);
+}
+
+function updateTotal() {
+  var total = 0;
+  exercises.forEach(function(e){ total += parseInt(e.dur)||0; });
+  var m = Math.floor(total/60), s = total%60;
+  document.getElementById('totalBadge').textContent = exercises.length + ' exercises';
+  document.getElementById('totalTime').innerHTML =
+    'Total duration: <span>' + m + 'm ' + (s>0?s+'s':'') + '</span>';
+}
+
+function renderList() {
+  var el = document.getElementById('exList');
+  el.innerHTML = '';
+  exercises.forEach(function(ex, i) {
+    var row = document.createElement('div');
+    row.className = 'ex-row';
+    row.innerHTML =
+      '<div class="ex-num">' + (i+1) + '</div>' +
+      '<input type="text" maxlength="20" value="' + escHtml(ex.name) +
+        '" oninput="exercises['+i+'].name=this.value">' +
+      '<div class="dur-wrap">' +
+        '<input type="number" min="5" max="600" value="' + ex.dur +
+          '" oninput="exercises['+i+'].dur=parseInt(this.value)||30;updateTotal()">' +
+        '<span>sec</span>' +
+      '</div>' +
+      '<button class="del-btn" onclick="delExercise('+i+')">&#10005;</button>';
+    el.appendChild(row);
+  });
+  updateTotal();
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+}
+
+function addExercise() {
+  if (exercises.length >= 20) { showToast('Max 20 exercises', false); return; }
+  exercises.push({name:'New Exercise', dur:30});
+  renderList();
+}
+
+function delExercise(i) {
+  if (exercises.length <= 1) { showToast('Need at least 1 exercise', false); return; }
+  exercises.splice(i, 1);
+  renderList();
+}
+
+function resetDefaults() {
+  if (!confirm('Reset all exercises and session times to factory defaults?')) return;
+  fetch('/defaults').then(function(r){return r.json();}).then(function(d){
+    applyData(d);
+    showToast('Reset to defaults', true);
+  });
+}
+
+function applyData(d) {
+  document.getElementById('s0').value = d.s[0];
+  document.getElementById('s1').value = d.s[1];
+  document.getElementById('s2').value = d.s[2];
+  exercises = d.exercises.map(function(e){ return {name:e.name, dur:e.dur}; });
+  renderList();
+}
+
+function saveAll() {
+  var btn = document.getElementById('saveBtn');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+
+  var payload = {
+    s: [
+      parseInt(document.getElementById('s0').value)||10,
+      parseInt(document.getElementById('s1').value)||30,
+      parseInt(document.getElementById('s2').value)||60
+    ],
+    exercises: exercises.map(function(e){
+      return {name: e.name.trim()||'Exercise', dur: parseInt(e.dur)||30};
+    })
+  };
+
+  fetch('/save', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(r){return r.text();}).then(function(){
+    showToast('Saved! Device will restart.', true);
+    btn.textContent = 'Saved ✓';
+    setTimeout(function(){ window.location.reload(); }, 3000);
+  }).catch(function(){
+    showToast('Save failed — try again', false);
+    btn.disabled=false; btn.textContent='Save to Device';
+  });
+}
+
+// Load current config on page open
+fetch('/config.json').then(function(r){return r.json();}).then(applyData);
+</script>
+</body>
+</html>
+)rawhtml";
+
+// ── Time sync page (existing) ────────────────────────────────
+const char TIME_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html>
 <html>
 <head>
@@ -402,32 +590,42 @@ const char HTML_PAGE[] PROGMEM = R"rawhtml(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>StudyMate Time Sync</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Segoe UI',sans-serif;background:#0f0f0f;color:#f0f0f0;
-       display:flex;flex-direction:column;align-items:center;
-       justify-content:center;min-height:100vh;padding:20px}
-  .card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:16px;
-        padding:32px 28px;width:100%;max-width:380px}
-  h1{font-size:1.5rem;font-weight:700;margin-bottom:4px}
-  .sub{font-size:.85rem;color:#888;margin-bottom:24px}
-  .preview{background:#111;border-radius:10px;padding:16px;margin-bottom:22px;text-align:center}
-  .preview .time{font-size:2.2rem;font-weight:700;color:#4f8fff;letter-spacing:.05em}
-  .preview .date{font-size:.9rem;color:#888;margin-top:4px}
-  label{display:block;font-size:.78rem;color:#aaa;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em}
-  input{width:100%;background:#111;border:1px solid #333;border-radius:8px;color:#fff;
-        font-size:1rem;padding:10px 14px;margin-bottom:18px;outline:none}
-  input:focus{border-color:#4f8fff}
-  button{width:100%;background:#4f8fff;border:none;border-radius:10px;color:#fff;
-         font-size:1.05rem;font-weight:600;padding:14px;cursor:pointer}
-  button:disabled{background:#333;color:#666}
-  .ok{display:none;margin-top:16px;background:#0d2e0d;border:1px solid #2d6a2d;
-      border-radius:10px;padding:14px;text-align:center;color:#5de85d;font-weight:600}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#0f0f0f;color:#f0f0f0;
+     display:flex;flex-direction:column;align-items:center;
+     justify-content:center;min-height:100vh;padding:20px}
+.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:16px;
+      padding:32px 28px;width:100%;max-width:380px}
+h1{font-size:1.5rem;font-weight:700;margin-bottom:4px}
+.sub{font-size:.85rem;color:#888;margin-bottom:24px}
+.nav{display:flex;gap:8px;margin-bottom:20px}
+.nav a{flex:1;background:#1a1a2a;border:1px solid #333355;border-radius:9px;
+       color:#8888cc;font-size:.82rem;padding:9px;text-align:center;
+       text-decoration:none;transition:all .15s}
+.nav a:hover,.nav a.active{background:#222244;border-color:#5555aa;color:#aaaaee}
+.preview{background:#111;border-radius:10px;padding:16px;margin-bottom:22px;text-align:center}
+.preview .time{font-size:2.2rem;font-weight:700;color:#4f8fff;letter-spacing:.05em}
+.preview .date{font-size:.9rem;color:#888;margin-top:4px}
+label{display:block;font-size:.78rem;color:#aaa;margin-bottom:5px;
+      text-transform:uppercase;letter-spacing:.05em}
+input{width:100%;background:#111;border:1px solid #333;border-radius:8px;color:#fff;
+      font-size:1rem;padding:10px 14px;margin-bottom:18px;outline:none}
+input:focus{border-color:#4f8fff}
+button{width:100%;background:#4f8fff;border:none;border-radius:10px;color:#fff;
+       font-size:1.05rem;font-weight:600;padding:14px;cursor:pointer}
+button:disabled{background:#333;color:#666}
+.ok{display:none;margin-top:16px;background:#0d2e0d;border:1px solid #2d6a2d;
+    border-radius:10px;padding:14px;text-align:center;color:#5de85d;font-weight:600}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>&#128337; StudyMate</h1>
-  <p class="sub">Sync your phone's time to the device</p>
+  <p class="sub">Connected to StudyMate-Setup</p>
+  <div class="nav">
+    <a href="/" class="active">&#9200; Time Sync</a>
+    <a href="/setup">&#9881; Setup</a>
+  </div>
   <div class="preview">
     <div class="time" id="liveTime">--:-- --</div>
     <div class="date" id="liveDate">Loading...</div>
@@ -448,7 +646,7 @@ function updatePreview(){var d=new Date(),h=d.getHours(),m=d.getMinutes(),s=d.ge
   var ap=h<12?'AM':'PM',h12=h%12||12;
   document.getElementById('liveTime').textContent=pad(h12)+':'+pad(m)+':'+pad(s)+' '+ap;
   document.getElementById('liveDate').textContent=days[d.getDay()]+', '+d.getDate()+' '+months[d.getMonth()]+' '+d.getFullYear();}
-fillNow(); setInterval(updatePreview,1000); updatePreview();
+fillNow();setInterval(updatePreview,1000);updatePreview();
 function syncTime(){var dv=document.getElementById('dateInput').value,tv=document.getElementById('timeInput').value;
   if(!dv||!tv){alert('Please fill in date and time.');return;}
   var dp=dv.split('-'),tp=tv.split(':');
@@ -456,25 +654,142 @@ function syncTime(){var dv=document.getElementById('dateInput').value,tv=documen
   fetch('/settime?epoch='+epoch).then(function(r){return r.text();}).then(function(){
     document.getElementById('okMsg').style.display='block';
     document.querySelector('button').disabled=true;
-  }).catch(function(){alert('Connection error. Are you on StudyMate-Setup WiFi?');});}
-</script></body></html>
+  }).catch(function(){alert('Connection error.');});}
+</script>
+</body>
+</html>
 )rawhtml";
 
+
 // ════════════════════════════════════════════════════════════
-//  WEB HANDLERS
+//  WEB SERVER HANDLERS
 // ════════════════════════════════════════════════════════════
-void handleRoot()    { server.send_P(200, "text/html", HTML_PAGE); }
-void handleNotFound(){ server.sendHeader("Location","http://192.168.4.1",true); server.send(302,"text/plain",""); }
+
+void handleRoot()      { server.send_P(200,"text/html",TIME_HTML); }
+void handleSetupPage() { server.send_P(200,"text/html",SETUP_HTML); }
+void handleNotFound()  { server.sendHeader("Location","http://192.168.4.1",true); server.send(302,"text/plain",""); }
 
 void handleSetTime() {
   if (!server.hasArg("epoch")) { server.send(400,"text/plain","Missing epoch"); return; }
-  time_t epoch = (time_t)server.arg("epoch").toInt();
-  if (timeSource == TS_RTC || rtc.begin()) { rtc.adjust(DateTime((uint32_t)epoch)); timeSource = TS_RTC; }
-  swEpoch = epoch; swMillis = millis();
-  if (timeSource == TS_NONE) timeSource = TS_SOFTWARE;
-  timeSynced = true;
+  time_t epoch=(time_t)server.arg("epoch").toInt();
+  if (timeSource==TS_RTC||rtc.begin()) { rtc.adjust(DateTime((uint32_t)epoch)); timeSource=TS_RTC; }
+  swEpoch=epoch; swMillis=millis();
+  if (timeSource==TS_NONE) timeSource=TS_SOFTWARE;
+  timeSynced=true;
   server.send(200,"text/plain","OK");
 }
+
+// GET /config.json — returns current runtime config as JSON
+void handleConfigJson() {
+  String json = "{\"s\":[";
+  json += sessionMins[0]; json += ",";
+  json += sessionMins[1]; json += ",";
+  json += sessionMins[2]; json += "],\"exercises\":[";
+  for (int i=0; i<numExercises; i++) {
+    if (i>0) json += ",";
+    json += "{\"name\":\"";
+    // escape quotes in name
+    for (int c=0; exList[i].name[c]; c++) {
+      char ch = exList[i].name[c];
+      if (ch=='"') json += "\\\""; else json += ch;
+    }
+    json += "\",\"dur\":"; json += exList[i].durationSec; json += "}";
+  }
+  json += "]}";
+  server.send(200,"application/json",json);
+}
+
+// GET /defaults — returns factory defaults as JSON (does NOT save)
+void handleDefaults() {
+  const char* dNames[] = {
+    "Get Ready!","Jack Squats","Push-Ups","Caterpillars",
+    "Inch Worms","Elbow Plank","Cat Stretch","Wats Up Dawg",
+    "Heel Tap Crunch","Hip Thrust","Squat+Calf Raise",
+    "Eagle Walks","Upright Plank","Hamstring Stretch",
+    "Superman Strokes","Neg. Push-Ups","Hip Stretch Lunge",
+    "Squat Taps","Jumping Jacks"
+  };
+  const int dDur[]={27,30,30,30,30,30,30,30,30,30,60,30,30,60,30,30,30,30,30};
+  String json="{\"s\":[10,30,60],\"exercises\":[";
+  for (int i=0;i<19;i++){
+    if(i>0)json+=",";
+    json+="{\"name\":\""; json+=dNames[i]; json+="\",\"dur\":"; json+=dDur[i]; json+="}";
+  }
+  json+="]}";
+  server.send(200,"application/json",json);
+}
+
+// POST /save — receives JSON, parses, saves to flash, restarts app state
+void handleSave() {
+  if (!server.hasArg("plain")) { server.send(400,"text/plain","No body"); return; }
+  String body = server.arg("plain");
+
+  // Simple JSON parser — no external library needed
+  // Format: {"s":[10,30,60],"exercises":[{"name":"...","dur":30},...]}
+
+  // Parse session minutes
+  int si = body.indexOf("\"s\":[");
+  if (si >= 0) {
+    si += 5;
+    for (int k=0; k<3; k++) {
+      int end = body.indexOf(k<2?',':']', si);
+      if (end<0) break;
+      int val = body.substring(si,end).toInt();
+      if (val>=1&&val<=180) sessionMins[k]=val;
+      si = end+1;
+    }
+  }
+
+  // Parse exercises
+  int exCount = 0;
+  int pos = body.indexOf("\"exercises\":[");
+  if (pos >= 0) {
+    pos += 13;
+    while (exCount < MAX_EXERCISES) {
+      int objStart = body.indexOf('{', pos);
+      if (objStart < 0) break;
+      int objEnd   = body.indexOf('}', objStart);
+      if (objEnd   < 0) break;
+      String obj   = body.substring(objStart, objEnd+1);
+
+      // name
+      int ni = obj.indexOf("\"name\":\"");
+      String nm = "Exercise";
+      if (ni >= 0) {
+        ni += 8;
+        int ne = ni;
+        while (ne < (int)obj.length() && !(obj[ne]=='"' && obj[ne-1]!='\\')) ne++;
+        nm = obj.substring(ni, ne);
+        nm.replace("\\\"","\"");
+      }
+      // dur
+      int di = obj.indexOf("\"dur\":");
+      int dur = 30;
+      if (di >= 0) {
+        di += 6;
+        int de = di;
+        while (de<(int)obj.length()&&(obj[de]>='0'&&obj[de]<='9')) de++;
+        dur = obj.substring(di,de).toInt();
+        if (dur<5)  dur=5;
+        if (dur>600) dur=600;
+      }
+
+      strncpy(exList[exCount].name, nm.c_str(), MAX_NAME_LEN);
+      exList[exCount].name[MAX_NAME_LEN]='\0';
+      exList[exCount].durationSec = dur;
+      exCount++;
+      pos = objEnd + 1;
+    }
+  }
+
+  if (exCount > 0) numExercises = exCount;
+  computeStartTimes();
+  saveConfig();
+  setupSaved = true;
+
+  server.send(200,"text/plain","OK");
+}
+
 
 // ════════════════════════════════════════════════════════════
 //  HOTSPOT
@@ -484,500 +799,320 @@ void startHotspot() {
   if (strlen(AP_PASS)>0) WiFi.softAP(AP_SSID,AP_PASS); else WiFi.softAP(AP_SSID);
   IPAddress ip(192,168,4,1),gw(192,168,4,1),sn(255,255,255,0);
   WiFi.softAPConfig(ip,gw,sn);
-  server.on("/",handleRoot); server.on("/settime",handleSetTime); server.onNotFound(handleNotFound);
+  server.on("/",          handleRoot);
+  server.on("/setup",     handleSetupPage);
+  server.on("/config.json",handleConfigJson);
+  server.on("/defaults",  handleDefaults);
+  server.on("/settime",   handleSetTime);
+  server.on("/save",      HTTP_POST, handleSave);
+  server.onNotFound(      handleNotFound);
   server.begin();
 }
 
-void stopHotspot() { server.stop(); WiFi.softAPdisconnect(true); WiFi.mode(WIFI_OFF); }
+void stopHotspot() {
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
 
 // ════════════════════════════════════════════════════════════
-//
-//   S C R E E N   D E S I G N S
-//
-//  Button hint row convention (row 3 on every screen):
-//
-//    [A] icon  description    [B] icon  description
-//
-//    "A" and "B" are the physical button labels on the PCB.
-//    Icons are custom chars drawn inline — no word like
-//    "next", "back", "open", "select" ever appears.
-//
-//  Icon legend used in hints:
-//    ↕  (#5) = scroll / move cursor
-//    ↓  (#5) = cycle down through options
-//    ↵  (#6) = confirm / enter / select
-//    ←  (#7) = go back one screen
-//    ⌂  (#7) = go all the way home
-//
+//  SCREENS
 // ════════════════════════════════════════════════════════════
 
-// ─────────────────────────────────────────────────────────────
-//  SPLASH
-//
-//  ┌────────────────────┐
-//  │                    │
-//  │   ♥ StudyMate ♥    │
-//  │  Your Focus Partner│
-//  │                    │
-//  └────────────────────┘
-// ─────────────────────────────────────────────────────────────
 void drawSplash() {
-  lcd.clear();
-  // heart is slot #4, always permanent — safe to use inline
-  lcd.setCursor(4, 1);
-  lcd.write(4); lcd.print(" StudyMate "); lcd.write(4);
-  printCenter(2, "Your Focus Partner");
+  slots_Done(); lcd.clear();
+  lcd.setCursor(4,1); lcd.write(4); lcd.print(" StudyMate "); lcd.write(4);
+  printCenter(2,"Your Focus Partner");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  WIFI TIME SYNC WAITING
-//
-//  ┌────────────────────┐
-//  │  ---  Set Time --- │
-//  │  WiFi: StudyMate   │
-//  │  Go: 192.168.4.1   │
-//  │  [B] ←  to skip    │
-//  └────────────────────┘
-// ─────────────────────────────────────────────────────────────
 void drawTimeSyncAP() {
-  slots_Sync();
-  lcd.clear();
-  printCenter(0, "---  Set Time  ---");
-  printCenter(1, "WiFi: StudyMate-Setup");
-  printCenter(2, "Go: 192.168.4.1");
-  // Row 3: [B] back-arrow  to skip
-  lcd.setCursor(3, 3);
-  lcd.print("[B]");
-  lcd.write(7);   // ← back arrow (slot 7 = icnBack after slots_Sync)
-  lcd.print("  to skip");
+  slots_Sync(); lcd.clear();
+  printCenter(0,"---  Set Time  ---");
+  printCenter(1,"WiFi: StudyMate-Setup");
+  printCenter(2,"Go: 192.168.4.1");
+  lcd.setCursor(3,3); lcd.print("[B]"); lcd.write(7); lcd.print("  to skip");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  SYNC DONE
-//
-//  ┌────────────────────┐
-//  │  ---  Synced!  --- │
-//  │                    │
-//  │      ✓  Done!      │
-//  │   Starting clock   │
-//  └────────────────────┘
-// ─────────────────────────────────────────────────────────────
 void drawSyncDone() {
-  slots_Sync();
-  lcd.clear();
-  printCenter(0, "---  Synced!  ---");
-  lcd.setCursor(6, 2);
-  lcd.write(6);   // ✓ checkmark
-  lcd.print("  All good!");
-  printCenter(3, "Starting clock...");
+  slots_Sync(); lcd.clear();
+  printCenter(0,"---  Synced!  ---");
+  lcd.setCursor(6,2); lcd.write(6); lcd.print("  All good!");
+  printCenter(3,"Starting clock...");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  HOME CLOCK
-//
-//  ┌────────────────────┐
-//  │⊙ Wed, 14 May '25   │
-//  │                    │
-//  │     10 : 45 AM     │
-//  │  --------------------  │
-//  └────────────────────┘
-//
-//  Row 2 is intentionally blank — gives the time room to breathe.
-//  Row 3 is a soft separator + icon hint (no seconds shown).
-// ─────────────────────────────────────────────────────────────
+// Setup AP screen
+// ┌────────────────────┐
+// │  >>>  SETUP  <<<   │
+// │  WiFi: StudyMate   │
+// │  Go: 192.168.4.1   │
+// │  [B] ← to exit     │
+// └────────────────────┘
+void drawSetupAP() {
+  slots_Sync(); lcd.clear();
+  printCenter(0,">>>  SETUP  <<<");
+  printCenter(1,"WiFi: StudyMate-Setup");
+  printCenter(2,"Go: 192.168.4.1");
+  lcd.setCursor(3,3); lcd.print("[B]"); lcd.write(7); lcd.print("  to exit");
+}
+
+void drawSetupSaved() {
+  slots_Sync(); lcd.clear();
+  printCenter(0,"---  Saved!  ---");
+  lcd.setCursor(5,2); lcd.write(6); lcd.print("  Config saved!");
+  printCenter(3,"Reloading...");
+}
+
+// Home clock — big digits
 void drawHomeClock() {
   decodeEpoch(nowEpoch());
-
-  lcd.clear();
-
-  // ── Row 0: day + date, no year, no icon, centred ────────
-  //  e.g.  "   Wed, 14 May   "
+  slots_BigDigits(); lcd.clear();
   char datePart[21];
-  snprintf(datePart, 21, "%s, %02d %s",
-           DOW_N[ct_dow], ct_day, MON_N[ct_month]);
-  printCenter(0, datePart);
-
-  // ── Row 1: blank (breathing space) ──────────────────────
-
-  // ── Row 2: big spaced time  "   HH : MM  AM   " ─────────
-  char timeLine[21];
-  snprintf(timeLine, 21, "   %02d : %02d  %s   ",
-           to12h(ct_hour), ct_minute, ampmStr(ct_hour));
-  lcd.setCursor(0, 2);
-  lcd.print(timeLine);
-
-  // ── Row 3: clean button hint, no dashes ─────────────────
-  //  "       [A] ▶            "  centred
-  lcd.setCursor(6, 3);
-  lcd.print("[A] ");
-  lcd.write(2);   // ▶ play arrow
-  lcd.print("  menu");
+  snprintf(datePart,21,"%s, %02d %s",DOW_N[ct_dow],ct_day,MON_N[ct_month]);
+  printCenter(0,datePart);
+  drawBigTime((int)to12h(ct_hour),(int)ct_minute,1);
+  lcd.setCursor(19,1); lcd.print(ct_hour<12?"A":"P");
+  lcd.setCursor(19,2); lcd.print("M");
+  lcd.setCursor(5,3); lcd.print("[A]  >>  menu");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  MAIN MENU
-//
-//  ┌────────────────────┐
-//  │  ====  MENU  ====  │
-//  │  ▶  Study Session  │
-//  │  □  Exercise Mode  │
-//  │[A]↕      [B]↵      │
-//  └────────────────────┘
-//
-//  Row 3 hint:  [A] ↕   (scroll)    [B] ↵  (confirm/enter)
-// ─────────────────────────────────────────────────────────────
+// Main menu — now 3 items: Study / Exercise / Settings
+// ┌────────────────────┐
+// │  ====  MENU  ====  │
+// │  ▶  Study Session  │
+// │  □  Exercise Mode  │
+// │  □  Settings       │
+// └────────────────────┘
+// Hint row: A scrolls, B selects — shown on a 4th "virtual" slot.
+// Since we have 3 items across rows 1-3 there is no room for a
+// separate hint row, so hint is embedded in the header as mini icons.
 void drawMainMenu() {
-  slots_Menu();
-  lcd.clear();
-  printCenter(0, "====  MENU  ====");
+  slots_Menu(); lcd.clear();
+  // Header with hint embedded right side
+  lcd.setCursor(0,0); lcd.print("====  MENU  ====");
+  lcd.setCursor(16,0); lcd.print("[A]"); lcd.write(5);  // [A]↕
 
-  // Row 1 — Study Session
-  lcd.setCursor(2, 1);
-  lcd.write(menuCursor == 0 ? 2 : 1);   // ▶ or □
-  lcd.print("  Study Session ");
-
-  // Row 2 — Exercise Mode
-  lcd.setCursor(2, 2);
-  lcd.write(menuCursor == 1 ? 2 : 1);   // ▶ or □
-  lcd.print("  Exercise Mode ");
-
-  // Row 3: [A] ↕  (6 chars)  spacer  [B] ↵  (6 chars)
-  lcd.setCursor(0, 3);
-  lcd.print("  [A]");
-  lcd.write(5);   // ↕ up-down
-  lcd.print("      [B]");
-  lcd.write(6);   // ↵ enter
-  lcd.print("  ");
+  lcd.setCursor(2,1); lcd.write(menuCursor==0?2:1); lcd.print("  Study Session ");
+  lcd.setCursor(2,2); lcd.write(menuCursor==1?2:1); lcd.print("  Exercise Mode ");
+  lcd.setCursor(2,3); lcd.write(menuCursor==2?2:1); lcd.print("  Settings      ");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  SESSION DURATION SELECT
-//
-//  ┌────────────────────┐
-//  │  == STUDY TIME ==  │
-//  │  ▶   10 min        │
-//  │  □   30 min        │
-//  │  □   60 min        │
-//  └────────────────────┘
-//
-//  Row 3 replaced by third option row (3 items fit rows 1-3).
-//  Hint moves to a mini inline strip after the last item:
-//
-//  Actually: 3 items on rows 1-3, hint embedded on row 3 right side
-//  when that item is NOT selected, or just shown cleanly below.
-//  Since all 4 rows are needed for 3 items + header we place the
-//  hint as a tiny [A]↓ [B]↵ on the RIGHT of the header row 0.
-// ─────────────────────────────────────────────────────────────
+// Session select
 void drawSessionSelect() {
-  slots_Session();
-  lcd.clear();
-
-  // Row 0: header + inline mini hint on right
-  lcd.setCursor(0, 0);
-  lcd.print("  STUDY TIME  ");
-  lcd.setCursor(14, 0);
-  lcd.print("[A]");
-  lcd.write(5);   // ↓ cycle
-  lcd.print("[B]");
-  lcd.write(6);   // ↵ confirm
-
-  // Rows 1-3: the three duration options (no "session" word)
-  const char* durations[] = {"  10 min", "  30 min", "  60 min"};
-  for (int i = 0; i < 3; i++) {
-    lcd.setCursor(2, i + 1);
-    lcd.write(sessionCursor == i ? 2 : 1);   // ▶ selected or □ unselected
-    lcd.print(durations[i]);
+  slots_Session(); lcd.clear();
+  lcd.setCursor(0,0); lcd.print("  STUDY TIME  ");
+  lcd.setCursor(14,0); lcd.print("[A]"); lcd.write(5); lcd.print("[B]"); lcd.write(6);
+  char dur[3][12];
+  snprintf(dur[0],12,"  %d min",sessionMins[0]);
+  snprintf(dur[1],12,"  %d min",sessionMins[1]);
+  snprintf(dur[2],12,"  %d min",sessionMins[2]);
+  for (int i=0;i<3;i++){
+    lcd.setCursor(2,i+1);
+    lcd.write(sessionCursor==i?2:1);
+    lcd.print(dur[i]);
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  STUDY RUNNING
-//
-//  ┌────────────────────┐
-//  │▶ ==  FOCUS MODE == │
-//  │                    │
-//  │      24 : 59       │
-//  │[████████--------]  │
-//  └────────────────────┘
-//
-//  Row 3: progress bar (no hint text — bar speaks for itself).
-//  Hint is embedded in row 0: icon changes ▶ / ⏸ to show state.
-//  Very bottom of screen: tiny [A]▶/⏸  [B]⌂  after bar on row 3.
-//
-//  Full layout:
-//  Row 0:  ▶ ==  FOCUS MODE ==
-//  Row 1:  (blank — breathing room)
-//  Row 2:       24 : 59
-//  Row 3:  [█████████-------]   (16 wide, 2 bracket chars = 18, +[A] hint)
-// ─────────────────────────────────────────────────────────────
+// Study running — big digits rows 1-2
 void drawStudyRunning() {
-  slots_Timer();
-  long total   = sessionOptions[sessionCursor] * 60L;
-  long remaining = studyTotalSeconds;
-  int  filled  = (int)(((total - remaining) * 16L) / total);
-
+  slots_BigDigits();
+  long total=sessionMins[sessionCursor]*60L, remaining=studyTotalSeconds;
+  int filled=(int)(((total-remaining)*16L)/total);
   lcd.clear();
-
-  // ── Row 0: state icon + header ──────────────────────────
-  lcd.setCursor(0, 0);
-  lcd.write(studyPaused ? 3 : 2);   // ⏸ or ▶
-  lcd.print(" ==  FOCUS MODE ==");
-
-  // ── Row 1: blank (breathing space) ──────────────────────
-
-  // ── Row 2: big spaced countdown ─────────────────────────
-  char cntLine[21];
-  snprintf(cntLine, 21, "     %02d : %02d      ",
-           (int)(remaining/60), (int)(remaining%60));
-  lcd.setCursor(0, 2);
-  lcd.print(cntLine);
-
-  // ── Row 3: progress bar + tiny hint ─────────────────────
-  lcd.setCursor(1, 3);
-  lcd.print("[");
-  for (int i = 0; i < 14; i++) lcd.write(i < filled ? 0 : 1);
+  lcd.setCursor(0,0); lcd.print(studyPaused?"||   FOCUS MODE    ":">    FOCUS MODE    ");
+  drawBigTime((int)(remaining/60),(int)(remaining%60),1);
+  lcd.setCursor(0,3); lcd.print("[");
+  for(int i=0;i<16;i++) lcd.write(i<filled?0:6);
   lcd.print("]");
-  // tiny [A] and [B⌂] hint squeezed after bar (cols 17-19)
-  lcd.setCursor(17, 3);
-  lcd.write(studyPaused ? 2 : 3);   // show what A will DO (toggle)
-  lcd.print(" ");
-  lcd.write(7);   // ⌂ home (B long)
+  lcd.setCursor(19,3); lcd.print(studyPaused?"|":">");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  EXERCISE RUNNING
-//
-//  ┌────────────────────┐
-//  │♪ == EXERCISE == ♪  │
-//  │                    │
-//  │    Jack  Squats    │
-//  │      09 : 33       │
-//  └────────────────────┘
-//
-//  Row 0: ♪ header ♪
-//  Row 1: blank (or "-- PAUSED --" when paused)
-//  Row 2: centred exercise name
-//  Row 3: big countdown  +  tiny state/home icons right-aligned
-// ─────────────────────────────────────────────────────────────
+// Exercise running — big digits rows 2-3
 void drawExerciseRunning() {
-  slots_Exercise();
-
-  int idx = 0;
-  for (int i = 0; i < NUM_EXERCISES; i++) {
-    if (exerciseElapsed >= exercises[i].atSecond) idx = i; else break;
-  }
-  long remaining = EXERCISE_TOTAL - exerciseElapsed;
-
+  slots_BigDigits();
+  int idx=0;
+  for(int i=0;i<numExercises;i++){if(exerciseElapsed>=atSecond[i])idx=i; else break;}
+  long remaining=totalExerciseSec()-exerciseElapsed;
   lcd.clear();
-
-  // ── Row 0: ♪ header ♪ ───────────────────────────────────
-  lcd.setCursor(0, 0);
-  lcd.write(5);   // ♪
-  lcd.print(" == EXERCISE ==");
-  lcd.setCursor(19, 0);
-  lcd.write(5);   // ♪
-
-  // ── Row 1: exercise name or PAUSED ──────────────────────
-  if (exercisePaused) {
-    printCenter(1, "- - PAUSED - -");
-  } else {
-    printCenter(1, exercises[idx].name);
-  }
-
-  // ── Row 2: blank (breathing space when not paused) ──────
-  // already blank from lcd.clear()
-
-  // ── Row 3: countdown + tiny icons right ─────────────────
-  char cntLine[21];
-  snprintf(cntLine, 21, "   %02d : %02d",
-           (int)(remaining/60), (int)(remaining%60));
-  lcd.setCursor(0, 3);
-  lcd.print(cntLine);
-  // icons at cols 14-19:  [A icon] space [B⌂]
-  lcd.setCursor(14, 3);
-  lcd.print("  ");
-  lcd.write(exercisePaused ? 2 : 3);   // show what A will DO
-  lcd.print("  ");
-  lcd.write(7);   // ⌂ home
+  lcd.setCursor(0,0); lcd.print(exercisePaused?"||  EXERCISE MODE  ":">>  EXERCISE MODE  ");
+  printCenter(1,exercisePaused?"- - PAUSED - -":exList[idx].name);
+  drawBigTime((int)(remaining/60),(int)(remaining%60),2);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  DONE SCREEN
-//
-//  ┌────────────────────┐
-//  │  - - - - - - - - - │
-//  │  ♥  Well Done!  ♥  │
-//  │  Amazing effort :) │
-//  │    Press any btn   │
-//  └────────────────────┘
-// ─────────────────────────────────────────────────────────────
+// Done screen
 void drawDone() {
-  lcd.clear();
-  printCenter(0, "- - - - - - - -");
-  lcd.setCursor(2, 1);
+  slots_Done(); lcd.clear();
+  printCenter(0,"- - - - - - - -");
+  lcd.setCursor(2,1); lcd.write(4);
+  lcd.print(doneIsExercise?"  Well Done!   ":"  Session Done!");
   lcd.write(4);
-  lcd.print(doneIsExercise ? "  Well Done!   " : "  Session Done!");
-  lcd.write(4);
-  printCenter(2, "Amazing effort :)");
-  printCenter(3, "-- Press any btn --");
+  printCenter(2,"Amazing effort :)");
+  printCenter(3,"-- Press any btn --");
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  STATE TRANSITIONS
 // ════════════════════════════════════════════════════════════
-void goToHome() {
-  appState = STATE_HOME_CLOCK;
-  lastClockUpdate = 0;
-  drawHomeClock();
-}
-
-void goToMainMenu() {
-  appState = STATE_MAIN_MENU;
-  menuCursor = 0;
-  drawMainMenu();
-}
+void goToHome()     { appState=STATE_HOME_CLOCK; lastClockUpdate=0; drawHomeClock(); }
+void goToMainMenu() { appState=STATE_MAIN_MENU;  menuCursor=0;      drawMainMenu(); }
 
 void startStudy() {
-  studyTotalSeconds = sessionOptions[sessionCursor] * 60L;
-  studyRunning = true; studyPaused = false;
-  studyPrevMillis = millis();
-  appState = STATE_STUDY_RUNNING;
-  drawStudyRunning();
+  studyTotalSeconds=sessionMins[sessionCursor]*60L;
+  studyRunning=true; studyPaused=false; studyPrevMillis=millis();
+  appState=STATE_STUDY_RUNNING; drawStudyRunning();
 }
 
 void startExercise() {
-  exerciseElapsed = 0;
-  exerciseRunning = true; exercisePaused = false;
-  exercisePrevMillis = millis();
-  appState = STATE_EXERCISE_RUNNING;
-  drawExerciseRunning();
+  exerciseElapsed=0; exerciseRunning=true; exercisePaused=false;
+  exercisePrevMillis=millis();
+  appState=STATE_EXERCISE_RUNNING; drawExerciseRunning();
 }
+
+void startSetupAP() {
+  setupSaved=false;
+  startHotspot();
+  appState=STATE_SETUP_AP;
+  drawSetupAP();
+}
+
 
 // ════════════════════════════════════════════════════════════
 //  SETUP
 // ════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  Wire.begin(4, 16);
-
-  pinMode(BTN_A, INPUT_PULLUP);
-  pinMode(BTN_B, INPUT_PULLUP);
-
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  Wire.begin(4,16);
+  pinMode(BTN_A,INPUT_PULLUP);
+  pinMode(BTN_B,INPUT_PULLUP);
+  pinMode(BUZZER_PIN,OUTPUT);
+  digitalWrite(BUZZER_PIN,LOW);
 
   lcd.init();
   lcd.backlight();
-  loadPermanentChars();   // load slots 0-4 once at boot
 
+  loadConfig();   // load from flash (or defaults)
+
+  slots_Done();
   drawSplash();
-  sfx_BootMelody();       // plays over the splash screen
+  sfx_BootMelody();
   delay(3000);
 
-  if (rtc.begin() && !rtc.lostPower()) {
-    timeSource = TS_RTC;
-    goToHome();
-    return;
+  if (rtc.begin()&&!rtc.lostPower()){
+    timeSource=TS_RTC; goToHome(); return;
   }
 
+  // No RTC — start hotspot for time sync
   startHotspot();
-  appState = STATE_TIME_SYNC_AP;
+  appState=STATE_TIME_SYNC_AP;
   drawTimeSyncAP();
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  LOOP
 // ════════════════════════════════════════════════════════════
 void loop() {
-  bool aShort, aLong, bShort, bLong;
-  handleBtn(BTN_A, btnA_pt, btnA_held, btnA_proc, aShort, aLong);
-  handleBtn(BTN_B, btnB_pt, btnB_held, btnB_proc, bShort, bLong);
+  bool aShort,aLong,bShort,bLong;
+  handleBtn(BTN_A,btnA_pt,btnA_held,btnA_proc,aShort,aLong);
+  handleBtn(BTN_B,btnB_pt,btnB_held,btnB_proc,bShort,bLong);
 
-  switch (appState) {
+  switch(appState){
 
+    // ── Time sync waiting ──────────────────────────────────
     case STATE_TIME_SYNC_AP:
       server.handleClient();
-      if (timeSynced) { stopHotspot(); drawSyncDone(); delay(2000); goToHome(); }
-      if (bLong) { sfx_Back(); stopHotspot(); swEpoch=0; swMillis=millis(); timeSource=TS_SOFTWARE; goToHome(); }
+      if(timeSynced){ stopHotspot(); drawSyncDone(); delay(2000); goToHome(); }
+      if(bLong){ sfx_Back(); stopHotspot(); swEpoch=0; swMillis=millis(); timeSource=TS_SOFTWARE; goToHome(); }
       break;
 
-    case STATE_HOME_CLOCK: {
-      unsigned long now = millis();
-      if (now - lastClockUpdate >= 1000) { lastClockUpdate = now; drawHomeClock(); }
-      if (aShort) { sfx_Confirm(); goToMainMenu(); }
+    // ── Setup AP ───────────────────────────────────────────
+    case STATE_SETUP_AP:
+      server.handleClient();
+      if(setupSaved){
+        sfx_Saved();
+        stopHotspot();
+        drawSetupSaved();
+        delay(2000);
+        goToMainMenu();
+      }
+      if(bLong){ sfx_Back(); stopHotspot(); goToMainMenu(); }
+      break;
+
+    // ── Home clock ─────────────────────────────────────────
+    case STATE_HOME_CLOCK:{
+      unsigned long now=millis();
+      if(now-lastClockUpdate>=1000){lastClockUpdate=now;drawHomeClock();}
+      if(aShort){sfx_Confirm();goToMainMenu();}
       break;
     }
 
+    // ── Main menu (3 items) ────────────────────────────────
     case STATE_MAIN_MENU:
-      if (aShort) { sfx_Navigate(); menuCursor=(menuCursor+1)%2; drawMainMenu(); }
-      if (bShort) {
+      if(aShort){sfx_Navigate();menuCursor=(menuCursor+1)%3;drawMainMenu();}
+      if(bShort){
         sfx_Confirm();
-        if (menuCursor==0) { sessionCursor=0; appState=STATE_SESSION_SELECT; drawSessionSelect(); }
-        else startExercise();
+        if(menuCursor==0){sessionCursor=0;appState=STATE_SESSION_SELECT;drawSessionSelect();}
+        else if(menuCursor==1) startExercise();
+        else startSetupAP();
       }
-      if (bLong) { sfx_Back(); goToHome(); }
+      if(bLong){sfx_Back();goToHome();}
       break;
 
+    // ── Session select ─────────────────────────────────────
     case STATE_SESSION_SELECT:
-      if (aShort) { sfx_Navigate(); sessionCursor=(sessionCursor+1)%3; drawSessionSelect(); }
-      if (bShort) { sfx_Confirm(); startStudy(); }
-      if (bLong)  { sfx_Back(); goToMainMenu(); }
+      if(aShort){sfx_Navigate();sessionCursor=(sessionCursor+1)%3;drawSessionSelect();}
+      if(bShort){sfx_Confirm();startStudy();}
+      if(bLong){sfx_Back();goToMainMenu();}
       break;
 
+    // ── Study running ──────────────────────────────────────
     case STATE_STUDY_RUNNING:
-      if (aShort) {
-        studyPaused = !studyPaused;
-        if (!studyPaused) { sfx_Resume(); studyPrevMillis = millis(); }
-        else              { sfx_Pause(); }
+      if(aShort){
+        studyPaused=!studyPaused;
+        if(!studyPaused){sfx_Resume();studyPrevMillis=millis();}else sfx_Pause();
         drawStudyRunning();
       }
-      if (bLong) { sfx_Back(); studyRunning=studyPaused=false; goToHome(); }
-      if (studyRunning && !studyPaused) {
-        unsigned long now = millis();
-        if (now - studyPrevMillis >= 1000) {
-          studyPrevMillis = now;
-          if (studyTotalSeconds > 0) { studyTotalSeconds--; drawStudyRunning(); }
-          else { sfx_Done(); studyRunning=false; doneIsExercise=false; appState=STATE_DONE; drawDone(); }
+      if(bLong){sfx_Back();studyRunning=studyPaused=false;goToHome();}
+      if(studyRunning&&!studyPaused){
+        unsigned long now=millis();
+        if(now-studyPrevMillis>=1000){
+          studyPrevMillis=now;
+          if(studyTotalSeconds>0){studyTotalSeconds--;drawStudyRunning();}
+          else{sfx_Done();studyRunning=false;doneIsExercise=false;appState=STATE_DONE;drawDone();}
         }
       }
       break;
 
+    // ── Exercise running ───────────────────────────────────
     case STATE_EXERCISE_RUNNING:
-      if (aShort) {
-        exercisePaused = !exercisePaused;
-        if (!exercisePaused) { sfx_Resume(); exercisePrevMillis = millis(); }
-        else                 { sfx_Pause(); }
+      if(aShort){
+        exercisePaused=!exercisePaused;
+        if(!exercisePaused){sfx_Resume();exercisePrevMillis=millis();}else sfx_Pause();
         drawExerciseRunning();
       }
-      if (bLong) { sfx_Back(); exerciseRunning=exercisePaused=false; goToHome(); }
-      if (exerciseRunning && !exercisePaused) {
-        unsigned long now = millis();
-        if (now - exercisePrevMillis >= 1000) {
-          exercisePrevMillis = now;
-          if (exerciseElapsed < EXERCISE_TOTAL) {
+      if(bLong){sfx_Back();exerciseRunning=exercisePaused=false;goToHome();}
+      if(exerciseRunning&&!exercisePaused){
+        unsigned long now=millis();
+        if(now-exercisePrevMillis>=1000){
+          exercisePrevMillis=now;
+          if(exerciseElapsed<totalExerciseSec()){
+            int prevIdx=0,newIdx=0;
+            for(int i=0;i<numExercises;i++){if(exerciseElapsed>=atSecond[i])prevIdx=i;else break;}
             exerciseElapsed++;
-
-            // Detect exercise boundary — chime when the move changes
-            int prevIdx = 0, newIdx = 0;
-            for (int i = 0; i < NUM_EXERCISES; i++) {
-              if ((exerciseElapsed - 1) >= exercises[i].atSecond) prevIdx = i; else break;
-            }
-            for (int i = 0; i < NUM_EXERCISES; i++) {
-              if (exerciseElapsed >= exercises[i].atSecond) newIdx = i; else break;
-            }
-            if (newIdx != prevIdx) sfx_ExerciseChange();
-
+            for(int i=0;i<numExercises;i++){if(exerciseElapsed>=atSecond[i])newIdx=i;else break;}
+            if(newIdx!=prevIdx) sfx_ExerciseChange();
             drawExerciseRunning();
           } else {
-            sfx_Done();
-            exerciseRunning=false; doneIsExercise=true; appState=STATE_DONE; drawDone();
+            sfx_Done();exerciseRunning=false;doneIsExercise=true;appState=STATE_DONE;drawDone();
           }
         }
       }
       break;
 
+    // ── Done ───────────────────────────────────────────────
     case STATE_DONE:
-      if (aShort || bShort || aLong || bLong) { sfx_ButtonClick(); goToHome(); }
+      if(aShort||bShort||aLong||bLong){sfx_ButtonClick();goToHome();}
       break;
 
     default: break;
