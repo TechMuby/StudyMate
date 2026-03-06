@@ -1,6 +1,6 @@
 /*
   ╔══════════════════════════════════════════════════════════╗
-  ║              StudyMate  Firmware  v6.0                   ║
+  ║              StudyMate  Firmware  v7.0                   ║
   ║     ESP32 + I2C 20x4 LCD + DS3231 OR ESP32 Hotspot       ║
   ╠══════════════════════════════════════════════════════════╣
   ║  WIRING                                                  ║
@@ -13,20 +13,20 @@
   ║  LIBRARIES  (Arduino Library Manager)                    ║
   ║  - LiquidCrystal I2C  by Frank de Brabander              ║
   ║  - RTClib              by Adafruit                       ║
-  ║  (WiFi, WebServer, Preferences — built into ESP32 core)  ║
+  ║  (WiFi, WebServer, Preferences — ESP32 Arduino core)     ║
   ╠══════════════════════════════════════════════════════════╣
-  ║  v6 NEW: SETUP PORTAL                                    ║
-  ║  "Settings" added to main menu → starts hotspot          ║
-  ║  Connect to StudyMate-Setup → open 192.168.4.1           ║
-  ║  Portal lets you:                                        ║
-  ║   • Edit all exercise names + durations (seconds)        ║
-  ║   • Edit the 3 study session durations (minutes)         ║
-  ║   • Reset everything to factory defaults                 ║
-  ║  Config saved to flash (Preferences) — survives reboot   ║
+  ║  v7 CHANGES                                              ║
+  ║  • TIMEZONE FIX: browser sends UTC offset (minutes)      ║
+  ║    alongside epoch so the device stores LOCAL time.      ║
+  ║    No more 1-hour offset.                                ║
+  ║  • ALARMS: up to 10 alarms, set via portal               ║
+  ║    Types: Once / Daily / Weekly (pick day)               ║
+  ║    Stored in flash, checked every second                 ║
+  ║    Triggered: buzzer alarm + LCD popup                   ║
+  ║  • SETUP PORTAL: 3 tabs — Time · Setup · Alarms          ║
   ╚══════════════════════════════════════════════════════════╝
 */
 
-// ── Includes ────────────────────────────────────────────────
 #include <time.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -35,16 +35,19 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-// ── Configuration ───────────────────────────────────────────
-#define AP_SSID     "StudyMate-Setup"
-#define AP_PASS     ""
-#define BTN_A       27
-#define BTN_B       26
-#define BUZZER_PIN  19
-#define MAX_EXERCISES 20
-#define MAX_NAME_LEN  20
+// ════════════════════════════════════════════════════════════
+//  PIN / CAPACITY CONSTANTS
+// ════════════════════════════════════════════════════════════
+#define AP_SSID        "StudyMate-Setup"
+#define AP_PASS        ""
+#define BTN_A          27
+#define BTN_B          26
+#define BUZZER_PIN     19
+#define MAX_EXERCISES  20
+#define MAX_NAME_LEN   20
+#define MAX_ALARMS     10
+#define ALARM_LABEL_LEN 18
 
-// ── Global objects ──────────────────────────────────────────
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 RTC_DS3231        rtc;
 WebServer         server(80);
@@ -52,176 +55,241 @@ Preferences       prefs;
 
 
 // ════════════════════════════════════════════════════════════
-//  RUNTIME CONFIG  (loaded from flash, edited via portal)
+//  TIMEZONE  (fix for 1-hour offset)
+//
+//  The browser sends:
+//    epoch      = Math.floor(Date.now() / 1000)   ← UTC epoch
+//    tzOffset   = -new Date().getTimezoneOffset()  ← local offset in MINUTES
+//                 (e.g. Lagos UTC+1 → tzOffset = 60)
+//
+//  We add tzOffset*60 to the epoch before storing, so the
+//  device always works in local time internally.
+//  decodeEpoch() uses gmtime_r (treats stored value as "UTC")
+//  which then gives correct LOCAL hours/minutes.
+// ════════════════════════════════════════════════════════════
+int32_t g_tzOffsetSec = 0;   // loaded from flash, updated on sync
+
+
+// ════════════════════════════════════════════════════════════
+//  EXERCISE CONFIG
 // ════════════════════════════════════════════════════════════
 struct ExerciseMove {
   char name[MAX_NAME_LEN + 1];
-  int  durationSec;   // how long this exercise lasts
+  int  durationSec;
 };
 
-// Working copies — modified by portal, persisted to flash
-int           numExercises = 0;
-ExerciseMove  exList[MAX_EXERCISES];
-int           sessionMins[3];   // e.g. {10, 30, 60}
-
-// Computed from exList — atSecond[i] = when exercise i starts
-int atSecond[MAX_EXERCISES];
+int          numExercises = 0;
+ExerciseMove exList[MAX_EXERCISES];
+int          sessionMins[3];
+int          atSecond[MAX_EXERCISES];
 
 void computeStartTimes() {
   int t = 0;
-  for (int i = 0; i < numExercises; i++) {
-    atSecond[i] = t;
-    t += exList[i].durationSec;
-  }
+  for (int i = 0; i < numExercises; i++) { atSecond[i] = t; t += exList[i].durationSec; }
 }
-
 int totalExerciseSec() {
-  int t = 0;
-  for (int i = 0; i < numExercises; i++) t += exList[i].durationSec;
-  return t;
+  int t = 0; for (int i = 0; i < numExercises; i++) t += exList[i].durationSec; return t;
 }
 
-// ── Factory defaults ─────────────────────────────────────────
 void loadDefaults() {
-  sessionMins[0] = 10;
-  sessionMins[1] = 30;
-  sessionMins[2] = 60;
-
-  const char* dNames[] = {
-    "Get Ready!","Jack Squats","Push-Ups","Caterpillars",
-    "Inch Worms","Elbow Plank","Cat Stretch","Wats Up Dawg",
-    "Heel Tap Crunch","Hip Thrust","Squat+Calf Raise",
-    "Eagle Walks","Upright Plank","Hamstring Stretch",
-    "Superman Strokes","Neg. Push-Ups","Hip Stretch Lunge",
-    "Squat Taps","Jumping Jacks"
+  sessionMins[0] = 10; sessionMins[1] = 30; sessionMins[2] = 60;
+  const char* dN[] = {
+    "Get Ready!","Jack Squats","Push-Ups","Caterpillars","Inch Worms",
+    "Elbow Plank","Cat Stretch","Wats Up Dawg","Heel Tap Crunch","Hip Thrust",
+    "Squat+Calf Raise","Eagle Walks","Upright Plank","Hamstring Stretch",
+    "Superman Strokes","Neg. Push-Ups","Hip Stretch Lunge","Squat Taps","Jumping Jacks"
   };
-  const int dDur[] = {
-    27,30,30,30,30,30,30,30,30,30,
-    60,30,30,60,30,30,30,30,30
-  };
+  const int dD[] = {27,30,30,30,30,30,30,30,30,30,60,30,30,60,30,30,30,30,30};
   numExercises = 19;
   for (int i = 0; i < numExercises; i++) {
-    strncpy(exList[i].name, dNames[i], MAX_NAME_LEN);
-    exList[i].name[MAX_NAME_LEN] = '\0';
-    exList[i].durationSec = dDur[i];
+    strncpy(exList[i].name, dN[i], MAX_NAME_LEN); exList[i].name[MAX_NAME_LEN]='\0';
+    exList[i].durationSec = dD[i];
   }
   computeStartTimes();
 }
 
-// ── Flash persistence ────────────────────────────────────────
+
+// ════════════════════════════════════════════════════════════
+//  ALARM SYSTEM
+// ════════════════════════════════════════════════════════════
+// Alarm type:
+//   0 = Once   (fires once at specified date+time, then disables itself)
+//   1 = Daily  (fires every day at HH:MM)
+//   2 = Weekly (fires on specified day-of-week at HH:MM)
+
+struct Alarm {
+  bool    enabled;
+  uint8_t type;       // 0=once 1=daily 2=weekly
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t dayOfWeek;  // 0=Sun..6=Sat  (used for weekly & once)
+  char    label[ALARM_LABEL_LEN + 1];
+};
+
+Alarm   alarms[MAX_ALARMS];
+int     numAlarms = 0;
+bool    alarmFiring = false;
+int     firingAlarmIdx = -1;
+unsigned long alarmStartMs = 0;
+const unsigned long ALARM_BUZZ_MS = 30000;  // buzz for 30s unless dismissed
+
+// Track last-checked minute so we don't double-fire
+uint8_t lastCheckedMin = 255;
+uint8_t lastCheckedHour = 255;
+
+
+// ════════════════════════════════════════════════════════════
+//  FLASH PERSISTENCE
+// ════════════════════════════════════════════════════════════
 void saveConfig() {
-  prefs.begin("studymate", false);
+  prefs.begin("sm", false);
   prefs.putInt("numEx", numExercises);
   for (int i = 0; i < numExercises; i++) {
-    char kName[12], kDur[12];
-    snprintf(kName, 12, "exN%d", i);
-    snprintf(kDur,  12, "exD%d", i);
-    prefs.putString(kName, exList[i].name);
-    prefs.putInt(kDur, exList[i].durationSec);
+    char kN[10], kD[10];
+    snprintf(kN,10,"eN%d",i); snprintf(kD,10,"eD%d",i);
+    prefs.putString(kN, exList[i].name);
+    prefs.putInt(kD, exList[i].durationSec);
   }
   prefs.putInt("s0", sessionMins[0]);
   prefs.putInt("s1", sessionMins[1]);
   prefs.putInt("s2", sessionMins[2]);
+  prefs.putInt("tz", (int)g_tzOffsetSec);
+  prefs.end();
+}
+
+void saveAlarms() {
+  prefs.begin("smal", false);
+  prefs.putInt("num", numAlarms);
+  for (int i = 0; i < numAlarms; i++) {
+    char k[12];
+    snprintf(k,12,"a%d",i);
+    // Pack: enabled(1) type(1) hour(1) min(1) dow(1) label(...)
+    uint8_t buf[5 + ALARM_LABEL_LEN + 1];
+    buf[0] = alarms[i].enabled ? 1 : 0;
+    buf[1] = alarms[i].type;
+    buf[2] = alarms[i].hour;
+    buf[3] = alarms[i].minute;
+    buf[4] = alarms[i].dayOfWeek;
+    memcpy(buf+5, alarms[i].label, ALARM_LABEL_LEN+1);
+    prefs.putBytes(k, buf, sizeof(buf));
+  }
+  prefs.end();
+}
+
+void loadAlarms() {
+  prefs.begin("smal", true);
+  numAlarms = prefs.getInt("num", 0);
+  if (numAlarms < 0 || numAlarms > MAX_ALARMS) numAlarms = 0;
+  for (int i = 0; i < numAlarms; i++) {
+    char k[12]; snprintf(k,12,"a%d",i);
+    uint8_t buf[5 + ALARM_LABEL_LEN + 1];
+    memset(buf, 0, sizeof(buf));
+    prefs.getBytes(k, buf, sizeof(buf));
+    alarms[i].enabled   = buf[0] != 0;
+    alarms[i].type      = buf[1];
+    alarms[i].hour      = buf[2];
+    alarms[i].minute    = buf[3];
+    alarms[i].dayOfWeek = buf[4];
+    memcpy(alarms[i].label, buf+5, ALARM_LABEL_LEN+1);
+    alarms[i].label[ALARM_LABEL_LEN] = '\0';
+  }
   prefs.end();
 }
 
 void loadConfig() {
-  prefs.begin("studymate", true);
+  prefs.begin("sm", true);
   int n = prefs.getInt("numEx", -1);
-  if (n < 1 || n > MAX_EXERCISES) {
+  if (n < 1 || n > MAX_EXERCISES) { prefs.end(); loadDefaults(); }
+  else {
+    numExercises = n;
+    for (int i = 0; i < numExercises; i++) {
+      char kN[10], kD[10];
+      snprintf(kN,10,"eN%d",i); snprintf(kD,10,"eD%d",i);
+      String s = prefs.getString(kN,"Exercise");
+      strncpy(exList[i].name, s.c_str(), MAX_NAME_LEN); exList[i].name[MAX_NAME_LEN]='\0';
+      exList[i].durationSec = prefs.getInt(kD,30);
+    }
+    sessionMins[0] = prefs.getInt("s0",10);
+    sessionMins[1] = prefs.getInt("s1",30);
+    sessionMins[2] = prefs.getInt("s2",60);
+    g_tzOffsetSec  = (int32_t)prefs.getInt("tz",0);
     prefs.end();
-    loadDefaults();
-    return;
+    computeStartTimes();
   }
-  numExercises = n;
-  for (int i = 0; i < numExercises; i++) {
-    char kName[12], kDur[12];
-    snprintf(kName, 12, "exN%d", i);
-    snprintf(kDur,  12, "exD%d", i);
-    String s = prefs.getString(kName, "Exercise");
-    strncpy(exList[i].name, s.c_str(), MAX_NAME_LEN);
-    exList[i].name[MAX_NAME_LEN] = '\0';
-    exList[i].durationSec = prefs.getInt(kDur, 30);
-  }
-  sessionMins[0] = prefs.getInt("s0", 10);
-  sessionMins[1] = prefs.getInt("s1", 30);
-  sessionMins[2] = prefs.getInt("s2", 60);
-  prefs.end();
-  computeStartTimes();
+  loadAlarms();
 }
 
 
 // ════════════════════════════════════════════════════════════
 //  CGRAM BITMAPS
 // ════════════════════════════════════════════════════════════
-byte segTF[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
-byte segTT[8] = {0x1F,0x1F,0x1F,0x1F,0x00,0x00,0x00,0x00};
-byte segTB[8] = {0x00,0x00,0x00,0x00,0x1F,0x1F,0x1F,0x1F};
-byte segBF[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
-byte segBT[8] = {0x1F,0x1F,0x1F,0x1F,0x00,0x00,0x00,0x00};
-byte segBB[8] = {0x00,0x00,0x00,0x00,0x1F,0x1F,0x1F,0x1F};
-byte segSP[8] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
-byte segHT[8] = {0x00,0x0A,0x1F,0x1F,0x0E,0x04,0x00,0x00};
+byte segTF[8]={0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
+byte segTT[8]={0x1F,0x1F,0x1F,0x1F,0x00,0x00,0x00,0x00};
+byte segTB[8]={0x00,0x00,0x00,0x00,0x1F,0x1F,0x1F,0x1F};
+byte segBF[8]={0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
+byte segBT[8]={0x1F,0x1F,0x1F,0x1F,0x00,0x00,0x00,0x00};
+byte segBB[8]={0x00,0x00,0x00,0x00,0x1F,0x1F,0x1F,0x1F};
+byte segSP[8]={0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+byte segHT[8]={0x00,0x0A,0x1F,0x1F,0x0E,0x04,0x00,0x00};
+byte icnPlay[8] ={0x08,0x0C,0x0E,0x0F,0x0E,0x0C,0x08,0x00};
+byte icnPause[8]={0x1B,0x1B,0x1B,0x1B,0x1B,0x1B,0x1B,0x00};
+byte icnSolid[8]={0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
+byte icnHollow[8]={0x1F,0x11,0x11,0x11,0x11,0x11,0x11,0x1F};
+byte icnUpDn[8] ={0x04,0x0E,0x1F,0x00,0x1F,0x0E,0x04,0x00};
+byte icnDown[8] ={0x04,0x04,0x04,0x04,0x1F,0x0E,0x04,0x00};
+byte icnEnter[8]={0x01,0x01,0x05,0x09,0x1F,0x08,0x04,0x00};
+byte icnBack[8] ={0x04,0x08,0x1F,0x08,0x04,0x00,0x00,0x00};
+byte icnNote[8] ={0x01,0x03,0x05,0x09,0x1B,0x1B,0x12,0x00};
+byte icnCheck[8]={0x00,0x01,0x01,0x02,0x14,0x08,0x00,0x00};
+byte icnBell[8] ={0x04,0x0E,0x0E,0x0E,0x1F,0x00,0x04,0x00};
 
-byte icnPlay[8]  = {0x08,0x0C,0x0E,0x0F,0x0E,0x0C,0x08,0x00};
-byte icnPause[8] = {0x1B,0x1B,0x1B,0x1B,0x1B,0x1B,0x1B,0x00};
-byte icnSolid[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
-byte icnHollow[8]= {0x1F,0x11,0x11,0x11,0x11,0x11,0x11,0x1F};
-byte icnUpDn[8]  = {0x04,0x0E,0x1F,0x00,0x1F,0x0E,0x04,0x00};
-byte icnDown[8]  = {0x04,0x04,0x04,0x04,0x1F,0x0E,0x04,0x00};
-byte icnEnter[8] = {0x01,0x01,0x05,0x09,0x1F,0x08,0x04,0x00};
-byte icnBack[8]  = {0x04,0x08,0x1F,0x08,0x04,0x00,0x00,0x00};
-byte icnNote[8]  = {0x01,0x03,0x05,0x09,0x1B,0x1B,0x12,0x00};
-byte icnCheck[8] = {0x00,0x01,0x01,0x02,0x14,0x08,0x00,0x00};
-
-void slots_BigDigits() {
-  lcd.createChar(0,segTF); lcd.createChar(1,segTT); lcd.createChar(2,segTB);
-  lcd.createChar(3,segBF); lcd.createChar(4,segBT); lcd.createChar(5,segBB);
-  lcd.createChar(6,segSP); lcd.createChar(7,segHT); lcd.home();
+void slots_BigDigits(){
+  lcd.createChar(0,segTF);lcd.createChar(1,segTT);lcd.createChar(2,segTB);
+  lcd.createChar(3,segBF);lcd.createChar(4,segBT);lcd.createChar(5,segBB);
+  lcd.createChar(6,segSP);lcd.createChar(7,segHT);lcd.home();
 }
-void slots_Menu() {
-  lcd.createChar(0,icnSolid);  lcd.createChar(1,icnHollow); lcd.createChar(2,icnPlay);
-  lcd.createChar(3,icnPause);  lcd.createChar(4,segHT);     lcd.createChar(5,icnUpDn);
-  lcd.createChar(6,icnEnter);  lcd.createChar(7,icnBack);   lcd.home();
+void slots_Menu(){
+  lcd.createChar(0,icnSolid); lcd.createChar(1,icnHollow);lcd.createChar(2,icnPlay);
+  lcd.createChar(3,icnPause); lcd.createChar(4,segHT);    lcd.createChar(5,icnUpDn);
+  lcd.createChar(6,icnEnter); lcd.createChar(7,icnBack);  lcd.home();
 }
-void slots_Session() {
-  lcd.createChar(1,icnHollow); lcd.createChar(2,icnPlay);
-  lcd.createChar(5,icnDown);   lcd.createChar(6,icnEnter); lcd.createChar(7,icnBack);
+void slots_Session(){
+  lcd.createChar(1,icnHollow);lcd.createChar(2,icnPlay);
+  lcd.createChar(5,icnDown);  lcd.createChar(6,icnEnter);lcd.createChar(7,icnBack);
   lcd.home();
 }
-void slots_Sync() {
-  lcd.createChar(4,segHT);    lcd.createChar(5,icnNote);
-  lcd.createChar(6,icnCheck); lcd.createChar(7,icnBack); lcd.home();
+void slots_Sync(){
+  lcd.createChar(4,segHT);   lcd.createChar(5,icnNote);
+  lcd.createChar(6,icnCheck);lcd.createChar(7,icnBack);lcd.home();
 }
-void slots_Done() { lcd.createChar(4,segHT); lcd.home(); }
+void slots_Alarm(){
+  lcd.createChar(4,segHT);lcd.createChar(5,icnBell);lcd.home();
+}
+void slots_Done(){ lcd.createChar(4,segHT);lcd.home(); }
 
 
 // ════════════════════════════════════════════════════════════
 //  BIG DIGIT RENDERER
 // ════════════════════════════════════════════════════════════
-const uint8_t DIGITS[10][6] = {
-  {0,1,0, 3,5,3}, {6,0,6, 6,3,6}, {2,1,0, 3,5,6}, {1,1,0, 5,5,3},
-  {0,2,0, 6,6,3}, {0,1,2, 5,5,3}, {0,1,2, 3,5,3}, {1,1,0, 6,4,6},
-  {0,1,0, 3,5,3}, {0,1,0, 5,5,3},
+const uint8_t DIGITS[10][6]={
+  {0,1,0,3,5,3},{6,0,6,6,3,6},{2,1,0,3,5,6},{1,1,0,5,5,3},
+  {0,2,0,6,6,3},{0,1,2,5,5,3},{0,1,2,3,5,3},{1,1,0,6,4,6},
+  {0,1,0,3,5,3},{0,1,0,5,5,3}
 };
-
-void drawBigDigit(int d, int col, int topRow) {
-  if (d<0||d>9) d=0;
-  lcd.setCursor(col,   topRow);   lcd.write(DIGITS[d][0]);
-  lcd.setCursor(col+1, topRow);   lcd.write(DIGITS[d][1]);
-  lcd.setCursor(col+2, topRow);   lcd.write(DIGITS[d][2]);
-  lcd.setCursor(col,   topRow+1); lcd.write(DIGITS[d][3]);
-  lcd.setCursor(col+1, topRow+1); lcd.write(DIGITS[d][4]);
-  lcd.setCursor(col+2, topRow+1); lcd.write(DIGITS[d][5]);
+void drawBigDigit(int d,int col,int topRow){
+  if(d<0||d>9)d=0;
+  lcd.setCursor(col,  topRow);  lcd.write(DIGITS[d][0]);
+  lcd.setCursor(col+1,topRow);  lcd.write(DIGITS[d][1]);
+  lcd.setCursor(col+2,topRow);  lcd.write(DIGITS[d][2]);
+  lcd.setCursor(col,  topRow+1);lcd.write(DIGITS[d][3]);
+  lcd.setCursor(col+1,topRow+1);lcd.write(DIGITS[d][4]);
+  lcd.setCursor(col+2,topRow+1);lcd.write(DIGITS[d][5]);
 }
-
-void drawBigTime(int left, int right, int topRow) {
-  drawBigDigit(left/10,  1, topRow);
-  drawBigDigit(left%10,  5, topRow);
-  lcd.setCursor(9, topRow);   lcd.print(".");
-  lcd.setCursor(9, topRow+1); lcd.print(".");
-  drawBigDigit(right/10, 11, topRow);
-  drawBigDigit(right%10, 15, topRow);
+void drawBigTime(int left,int right,int topRow){
+  drawBigDigit(left/10, 1,topRow); drawBigDigit(left%10, 5,topRow);
+  lcd.setCursor(9,topRow);  lcd.print(".");
+  lcd.setCursor(9,topRow+1);lcd.print(".");
+  drawBigDigit(right/10,11,topRow); drawBigDigit(right%10,15,topRow);
 }
 
 
@@ -237,73 +305,107 @@ void drawBigTime(int left, int right, int topRow) {
 #define NOTE_G5 784
 #define NOTE_A5 880
 
-void buzzNoteGap(int freq, int dur, int gap=30) {
-  if (freq>0) tone(BUZZER_PIN,freq,dur); else noTone(BUZZER_PIN);
-  delay(dur); noTone(BUZZER_PIN); delay(gap);
+void buzzNoteGap(int freq,int dur,int gap=30){
+  if(freq>0)tone(BUZZER_PIN,freq,dur);else noTone(BUZZER_PIN);
+  delay(dur);noTone(BUZZER_PIN);delay(gap);
 }
-void sfx_ButtonClick()    { tone(BUZZER_PIN,1800,18); }
-void sfx_Navigate()       { tone(BUZZER_PIN,1200,25); }
-void sfx_Confirm()        { buzzNoteGap(NOTE_E5,60,20); buzzNoteGap(NOTE_G5,80,0); }
-void sfx_Back()           { buzzNoteGap(NOTE_G4,60,20); buzzNoteGap(NOTE_E4,80,0); }
-void sfx_Pause()          { tone(BUZZER_PIN,400,120); }
-void sfx_Resume()         { tone(BUZZER_PIN,NOTE_A5,80); }
-void sfx_Saved()          { buzzNoteGap(NOTE_C5,80,15); buzzNoteGap(NOTE_E5,80,15); buzzNoteGap(NOTE_C5,160,0); }
-void sfx_ExerciseChange() { buzzNoteGap(NOTE_C5,70,25); buzzNoteGap(NOTE_E5,70,25); buzzNoteGap(NOTE_G5,110,0); }
-void sfx_Done()           { buzzNoteGap(NOTE_C5,100,20); buzzNoteGap(NOTE_E5,100,20); buzzNoteGap(NOTE_G5,100,20); buzzNoteGap(NOTE_C5,250,0); }
-void sfx_BootMelody()     {
-  buzzNoteGap(NOTE_C4,160,40); buzzNoteGap(NOTE_E4,160,40);
-  buzzNoteGap(NOTE_G4,160,40); buzzNoteGap(NOTE_C5,280,60);
-  buzzNoteGap(NOTE_G4,130,30); buzzNoteGap(NOTE_A4,130,30);
-  buzzNoteGap(NOTE_G4,130,30); buzzNoteGap(NOTE_E4,130,30);
+void sfx_ButtonClick()   {tone(BUZZER_PIN,1800,18);}
+void sfx_Navigate()      {tone(BUZZER_PIN,1200,25);}
+void sfx_Confirm()       {buzzNoteGap(NOTE_E5,60,20);buzzNoteGap(NOTE_G5,80,0);}
+void sfx_Back()          {buzzNoteGap(NOTE_G4,60,20);buzzNoteGap(NOTE_E4,80,0);}
+void sfx_Pause()         {tone(BUZZER_PIN,400,120);}
+void sfx_Resume()        {tone(BUZZER_PIN,NOTE_A5,80);}
+void sfx_Saved()         {buzzNoteGap(NOTE_C5,80,15);buzzNoteGap(NOTE_E5,80,15);buzzNoteGap(NOTE_C5,160,0);}
+void sfx_ExerciseChange(){buzzNoteGap(NOTE_C5,70,25);buzzNoteGap(NOTE_E5,70,25);buzzNoteGap(NOTE_G5,110,0);}
+void sfx_Done()          {buzzNoteGap(NOTE_C5,100,20);buzzNoteGap(NOTE_E5,100,20);buzzNoteGap(NOTE_G5,100,20);buzzNoteGap(NOTE_C5,250,0);}
+void sfx_BootMelody()    {
+  buzzNoteGap(NOTE_C4,160,40);buzzNoteGap(NOTE_E4,160,40);
+  buzzNoteGap(NOTE_G4,160,40);buzzNoteGap(NOTE_C5,280,60);
+  buzzNoteGap(NOTE_G4,130,30);buzzNoteGap(NOTE_A4,130,30);
+  buzzNoteGap(NOTE_G4,130,30);buzzNoteGap(NOTE_E4,130,30);
   buzzNoteGap(NOTE_C4,260,0);
+}
+// Alarm ring — urgent repeating two-tone
+void sfx_AlarmTick(){
+  tone(BUZZER_PIN,NOTE_A5,80); delay(100);
+  tone(BUZZER_PIN,NOTE_E5,80); delay(100);
+  noTone(BUZZER_PIN);
 }
 
 
 // ════════════════════════════════════════════════════════════
 //  TIME SOURCE
 // ════════════════════════════════════════════════════════════
-enum TimeSource { TS_NONE, TS_RTC, TS_SOFTWARE };
-TimeSource timeSource = TS_NONE;
-time_t   swEpoch  = 0;
-uint32_t swMillis = 0;
+enum TimeSource{TS_NONE,TS_RTC,TS_SOFTWARE};
+TimeSource timeSource=TS_NONE;
+time_t   swEpoch=0;
+uint32_t swMillis=0;
 
-time_t nowEpoch() {
-  if (timeSource==TS_RTC) return (time_t)rtc.now().unixtime();
-  return swEpoch + (time_t)((millis()-swMillis)/1000UL);
+// Returns LOCAL epoch (already offset-corrected)
+time_t nowEpoch(){
+  if(timeSource==TS_RTC) return (time_t)rtc.now().unixtime();
+  return swEpoch+(time_t)((millis()-swMillis)/1000UL);
 }
 
 uint16_t ct_year; uint8_t ct_month,ct_day,ct_hour,ct_minute,ct_second,ct_dow;
-void decodeEpoch(time_t ep) {
+void decodeEpoch(time_t ep){
   struct tm t; gmtime_r(&ep,&t);
-  ct_year=(uint16_t)(t.tm_year+1900); ct_month=(uint8_t)(t.tm_mon+1);
-  ct_day=(uint8_t)t.tm_mday; ct_hour=(uint8_t)t.tm_hour;
-  ct_minute=(uint8_t)t.tm_min; ct_second=(uint8_t)t.tm_sec; ct_dow=(uint8_t)t.tm_wday;
+  ct_year  =(uint16_t)(t.tm_year+1900); ct_month=(uint8_t)(t.tm_mon+1);
+  ct_day   =(uint8_t)t.tm_mday;         ct_hour =(uint8_t)t.tm_hour;
+  ct_minute=(uint8_t)t.tm_min;          ct_second=(uint8_t)t.tm_sec;
+  ct_dow   =(uint8_t)t.tm_wday;
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  ALARM CHECKER  — call once per second from loop
+// ════════════════════════════════════════════════════════════
+void checkAlarms(){
+  if(alarmFiring) return;
+  if(ct_hour==lastCheckedHour && ct_minute==lastCheckedMin) return;
+  lastCheckedHour=ct_hour; lastCheckedMin=ct_minute;
+
+  for(int i=0;i<numAlarms;i++){
+    if(!alarms[i].enabled) continue;
+    if(alarms[i].hour!=ct_hour||alarms[i].minute!=ct_minute) continue;
+    bool fire=false;
+    switch(alarms[i].type){
+      case 0: fire=(alarms[i].dayOfWeek==ct_dow); break; // once — match day
+      case 1: fire=true; break;                           // daily — always
+      case 2: fire=(alarms[i].dayOfWeek==ct_dow); break; // weekly
+    }
+    if(fire){
+      alarmFiring=true;
+      firingAlarmIdx=i;
+      alarmStartMs=millis();
+      if(alarms[i].type==0) alarms[i].enabled=false; // once → disable after firing
+      saveAlarms();
+      return;
+    }
+  }
 }
 
 
 // ════════════════════════════════════════════════════════════
 //  APP STATES
 // ════════════════════════════════════════════════════════════
-enum AppState {
-  STATE_SPLASH, STATE_TIME_SYNC_AP, STATE_HOME_CLOCK,
-  STATE_MAIN_MENU, STATE_SESSION_SELECT,
-  STATE_STUDY_RUNNING, STATE_EXERCISE_RUNNING,
-  STATE_SETUP_AP, STATE_DONE
+enum AppState{
+  STATE_SPLASH,STATE_TIME_SYNC_AP,STATE_HOME_CLOCK,
+  STATE_MAIN_MENU,STATE_SESSION_SELECT,
+  STATE_STUDY_RUNNING,STATE_EXERCISE_RUNNING,
+  STATE_SETUP_AP,STATE_ALARM_POPUP,STATE_DONE
 };
-AppState appState = STATE_SPLASH;
+AppState appState=STATE_SPLASH;
+AppState stateBeforeAlarm=STATE_HOME_CLOCK;
 
-unsigned long lastClockUpdate = 0;
-bool          timeSynced      = false;
-bool          setupSaved      = false;
-int           menuCursor      = 0;  // 0=Study 1=Exercise 2=Settings
-int           sessionCursor   = 0;
-
-long          studyTotalSeconds = 0;
-bool          studyRunning=false, studyPaused=false;
+unsigned long lastClockUpdate=0;
+bool timeSynced=false,setupSaved=false;
+int  menuCursor=0,sessionCursor=0;
+long          studyTotalSeconds=0;
+bool          studyRunning=false,studyPaused=false;
 unsigned long studyPrevMillis=0;
-
 long          exerciseElapsed=0;
-bool          exerciseRunning=false, exercisePaused=false, doneIsExercise=false;
+bool          exerciseRunning=false,exercisePaused=false,doneIsExercise=false;
 unsigned long exercisePrevMillis=0;
 
 
@@ -312,15 +414,15 @@ unsigned long exercisePrevMillis=0;
 // ════════════════════════════════════════════════════════════
 unsigned long btnA_pt=0,btnB_pt=0;
 bool btnA_held=false,btnB_held=false,btnA_proc=false,btnB_proc=false;
-const unsigned long LONG_PRESS=700, DEBOUNCE=50;
+const unsigned long LONG_PRESS=700,DEBOUNCE=50;
 
 void handleBtn(int pin,unsigned long &pt,bool &held,bool &proc,bool &sOut,bool &lOut){
-  sOut=false; lOut=false;
+  sOut=false;lOut=false;
   if(digitalRead(pin)==LOW){
     if(!held){held=true;proc=false;pt=millis();}
     else if(!proc&&millis()-pt>=LONG_PRESS){lOut=true;proc=true;}
-  } else {
-    if(held){if(!proc&&millis()-pt>=DEBOUNCE)sOut=true; held=false;proc=false;}
+  }else{
+    if(held){if(!proc&&millis()-pt>=DEBOUNCE)sOut=true;held=false;proc=false;}
   }
 }
 
@@ -328,465 +430,503 @@ void handleBtn(int pin,unsigned long &pt,bool &held,bool &proc,bool &sOut,bool &
 // ════════════════════════════════════════════════════════════
 //  LCD UTILITIES
 // ════════════════════════════════════════════════════════════
-void printCenter(int row,const char* txt){
+void printCenter(int row,const char*txt){
   int len=(int)strlen(txt),col=(20-len)/2;
-  if(col<0)col=0; lcd.setCursor(col,row); lcd.print(txt);
+  if(col<0)col=0;lcd.setCursor(col,row);lcd.print(txt);
 }
-const char* DOW_N[]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-const char* MON_N[]={"","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+const char*DOW_N[]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+const char*MON_N[]={"","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
 uint8_t to12h(uint8_t h){return (h==0)?12:(h>12?h-12:h);}
-const char* ampmStr(uint8_t h){return (h<12)?"AM":"PM";}
+const char*ampmStr(uint8_t h){return (h<12)?"AM":"PM";}
 
 
 // ════════════════════════════════════════════════════════════
-//  SETUP PORTAL HTML
-//  Served at 192.168.4.1/setup
-//  Single-page app — loads current config via /config.json,
-//  renders editable form, posts changes to /save
+//  HTML PAGES
 // ════════════════════════════════════════════════════════════
-const char SETUP_HTML[] PROGMEM = R"rawhtml(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>StudyMate Setup</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',sans-serif;background:#0a0a0f;color:#e8e8f0;min-height:100vh;padding:0 0 60px}
-header{background:#111128;border-bottom:1px solid #222244;padding:18px 20px;
-       display:flex;align-items:center;gap:12px}
-header h1{font-size:1.3rem;font-weight:700;color:#fff}
-header span{font-size:.8rem;color:#6668aa;background:#1a1a3a;
-            border:1px solid #333366;border-radius:20px;padding:3px 10px}
-.container{max-width:600px;margin:0 auto;padding:24px 16px}
-.section{background:#111128;border:1px solid #1e1e40;border-radius:14px;
-         margin-bottom:20px;overflow:hidden}
-.section-header{padding:14px 18px;background:#161635;border-bottom:1px solid #1e1e40;
-                display:flex;justify-content:space-between;align-items:center}
-.section-header h2{font-size:.95rem;font-weight:600;color:#9090d0}
-.section-header .badge{font-size:.72rem;background:#0d0d2a;color:#6668aa;
-                       border:1px solid #2a2a55;border-radius:12px;padding:2px 8px}
-.sessions{display:flex;gap:12px;padding:18px}
-.sess-item{flex:1;display:flex;flex-direction:column;gap:6px}
-.sess-item label{font-size:.72rem;color:#8888aa;text-transform:uppercase;letter-spacing:.06em}
-.sess-item input{background:#0d0d22;border:1px solid #2a2a55;border-radius:8px;
-                 color:#fff;font-size:1.1rem;font-weight:600;padding:10px;
-                 text-align:center;width:100%;outline:none}
-.sess-item input:focus{border-color:#5555cc}
-.sess-unit{font-size:.7rem;color:#6668aa;text-align:center;margin-top:2px}
-.ex-list{padding:0}
-.ex-row{display:grid;grid-template-columns:24px 1fr 80px 36px;align-items:center;
-        gap:8px;padding:10px 16px;border-bottom:1px solid #1a1a38}
-.ex-row:last-child{border-bottom:none}
-.ex-num{font-size:.72rem;color:#4444aa;font-weight:700;text-align:center}
-.ex-row input[type=text]{background:#0d0d22;border:1px solid #22224a;
-                         border-radius:7px;color:#e0e0ff;font-size:.9rem;
-                         padding:7px 10px;width:100%;outline:none}
-.ex-row input[type=text]:focus{border-color:#5555cc}
-.dur-wrap{display:flex;align-items:center;gap:4px}
-.dur-wrap input[type=number]{background:#0d0d22;border:1px solid #22224a;
-                              border-radius:7px;color:#7adfaa;font-size:.9rem;
-                              font-weight:600;padding:7px 6px;width:52px;
-                              text-align:center;outline:none}
-.dur-wrap input[type=number]:focus{border-color:#5555cc}
-.dur-wrap span{font-size:.7rem;color:#5566aa}
-.del-btn{background:none;border:1px solid #331122;border-radius:6px;
-         color:#885566;font-size:.85rem;cursor:pointer;padding:5px 8px;
-         line-height:1;transition:all .15s}
-.del-btn:hover{background:#220011;border-color:#aa2244;color:#ff4466}
-.add-btn{display:flex;align-items:center;gap:8px;margin:12px 16px;
-         background:#0d1a22;border:1px dashed #224433;border-radius:9px;
-         color:#448866;font-size:.85rem;padding:10px 14px;cursor:pointer;
-         width:calc(100% - 32px);justify-content:center;transition:all .15s}
-.add-btn:hover{background:#0d2218;border-color:#336644;color:#66cc99}
-.footer{position:fixed;bottom:0;left:0;right:0;background:#0d0d20;
-        border-top:1px solid #1e1e40;padding:12px 16px;
-        display:flex;gap:10px;max-width:600px;margin:0 auto}
-.btn-save{flex:1;background:#2233aa;border:none;border-radius:10px;
-          color:#fff;font-size:.95rem;font-weight:700;padding:13px;
-          cursor:pointer;transition:background .15s}
-.btn-save:hover{background:#3344cc}
-.btn-save:disabled{background:#222244;color:#555577}
-.btn-reset{background:#1a0d0d;border:1px solid #331111;border-radius:10px;
-           color:#774444;font-size:.85rem;padding:13px 16px;cursor:pointer;
-           transition:all .15s;white-space:nowrap}
-.btn-reset:hover{background:#220000;border-color:#662222;color:#ff6666}
-.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%) translateY(-80px);
-       background:#0d2e1a;border:1px solid #1d6040;border-radius:12px;
-       padding:12px 22px;color:#4ddd90;font-weight:600;font-size:.9rem;
-       transition:transform .3s;z-index:999;white-space:nowrap}
-.toast.show{transform:translateX(-50%) translateY(0)}
-.total-time{padding:8px 18px 12px;font-size:.75rem;color:#5566aa}
-.total-time span{color:#8899cc;font-weight:600}
-</style>
-</head>
-<body>
-<header>
-  <h1>&#9881; StudyMate Setup</h1>
-  <span>192.168.4.1</span>
-</header>
-<div class="container">
-  <div class="section">
-    <div class="section-header">
-      <h2>Study Session Durations</h2>
-      <span class="badge">minutes</span>
-    </div>
-    <div class="sessions">
-      <div class="sess-item">
-        <label>Option 1</label>
-        <input type="number" id="s0" min="1" max="180">
-        <div class="sess-unit">min</div>
-      </div>
-      <div class="sess-item">
-        <label>Option 2</label>
-        <input type="number" id="s1" min="1" max="180">
-        <div class="sess-unit">min</div>
-      </div>
-      <div class="sess-item">
-        <label>Option 3</label>
-        <input type="number" id="s2" min="1" max="180">
-        <div class="sess-unit">min</div>
-      </div>
-    </div>
-  </div>
 
-  <div class="section">
-    <div class="section-header">
-      <h2>Exercise Routine</h2>
-      <span class="badge" id="totalBadge">-- total</span>
-    </div>
-    <div class="ex-list" id="exList"></div>
-    <button class="add-btn" onclick="addExercise()">+ Add Exercise</button>
-    <div class="total-time" id="totalTime"></div>
-  </div>
-</div>
-
-<div class="footer">
-  <button class="btn-reset" onclick="resetDefaults()">&#8635; Reset</button>
-  <button class="btn-save" id="saveBtn" onclick="saveAll()">Save to Device</button>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<script>
-var exercises = [];
-
-function showToast(msg, ok) {
-  var t = document.getElementById('toast');
-  t.textContent = (ok ? '✓ ' : '⚠ ') + msg;
-  t.style.background = ok ? '#0d2e1a' : '#2e1a0d';
-  t.style.color = ok ? '#4ddd90' : '#ffaa44';
-  t.style.borderColor = ok ? '#1d6040' : '#604020';
-  t.classList.add('show');
-  setTimeout(function(){t.classList.remove('show');}, 2500);
-}
-
-function updateTotal() {
-  var total = 0;
-  exercises.forEach(function(e){ total += parseInt(e.dur)||0; });
-  var m = Math.floor(total/60), s = total%60;
-  document.getElementById('totalBadge').textContent = exercises.length + ' exercises';
-  document.getElementById('totalTime').innerHTML =
-    'Total duration: <span>' + m + 'm ' + (s>0?s+'s':'') + '</span>';
-}
-
-function renderList() {
-  var el = document.getElementById('exList');
-  el.innerHTML = '';
-  exercises.forEach(function(ex, i) {
-    var row = document.createElement('div');
-    row.className = 'ex-row';
-    row.innerHTML =
-      '<div class="ex-num">' + (i+1) + '</div>' +
-      '<input type="text" maxlength="20" value="' + escHtml(ex.name) +
-        '" oninput="exercises['+i+'].name=this.value">' +
-      '<div class="dur-wrap">' +
-        '<input type="number" min="5" max="600" value="' + ex.dur +
-          '" oninput="exercises['+i+'].dur=parseInt(this.value)||30;updateTotal()">' +
-        '<span>sec</span>' +
-      '</div>' +
-      '<button class="del-btn" onclick="delExercise('+i+')">&#10005;</button>';
-    el.appendChild(row);
-  });
-  updateTotal();
-}
-
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
-}
-
-function addExercise() {
-  if (exercises.length >= 20) { showToast('Max 20 exercises', false); return; }
-  exercises.push({name:'New Exercise', dur:30});
-  renderList();
-}
-
-function delExercise(i) {
-  if (exercises.length <= 1) { showToast('Need at least 1 exercise', false); return; }
-  exercises.splice(i, 1);
-  renderList();
-}
-
-function resetDefaults() {
-  if (!confirm('Reset all exercises and session times to factory defaults?')) return;
-  fetch('/defaults').then(function(r){return r.json();}).then(function(d){
-    applyData(d);
-    showToast('Reset to defaults', true);
-  });
-}
-
-function applyData(d) {
-  document.getElementById('s0').value = d.s[0];
-  document.getElementById('s1').value = d.s[1];
-  document.getElementById('s2').value = d.s[2];
-  exercises = d.exercises.map(function(e){ return {name:e.name, dur:e.dur}; });
-  renderList();
-}
-
-function saveAll() {
-  var btn = document.getElementById('saveBtn');
-  btn.disabled = true;
-  btn.textContent = 'Saving...';
-
-  var payload = {
-    s: [
-      parseInt(document.getElementById('s0').value)||10,
-      parseInt(document.getElementById('s1').value)||30,
-      parseInt(document.getElementById('s2').value)||60
-    ],
-    exercises: exercises.map(function(e){
-      return {name: e.name.trim()||'Exercise', dur: parseInt(e.dur)||30};
-    })
-  };
-
-  fetch('/save', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(payload)
-  }).then(function(r){return r.text();}).then(function(){
-    showToast('Saved! Device will restart.', true);
-    btn.textContent = 'Saved ✓';
-    setTimeout(function(){ window.location.reload(); }, 3000);
-  }).catch(function(){
-    showToast('Save failed — try again', false);
-    btn.disabled=false; btn.textContent='Save to Device';
-  });
-}
-
-// Load current config on page open
-fetch('/config.json').then(function(r){return r.json();}).then(applyData);
-</script>
-</body>
-</html>
-)rawhtml";
-
-// ── Time sync page (existing) ────────────────────────────────
+// ── Time sync page ───────────────────────────────────────────
+// KEY FIX: sends both epoch (UTC) and tzOffset (minutes, e.g. 60 for UTC+1)
+// /settime?epoch=NNNN&tz=60
 const char TIME_HTML[] PROGMEM = R"rawhtml(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>StudyMate Time Sync</title>
+<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StudyMate</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',sans-serif;background:#0f0f0f;color:#f0f0f0;
-     display:flex;flex-direction:column;align-items:center;
-     justify-content:center;min-height:100vh;padding:20px}
-.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:16px;
-      padding:32px 28px;width:100%;max-width:380px}
-h1{font-size:1.5rem;font-weight:700;margin-bottom:4px}
-.sub{font-size:.85rem;color:#888;margin-bottom:24px}
-.nav{display:flex;gap:8px;margin-bottom:20px}
-.nav a{flex:1;background:#1a1a2a;border:1px solid #333355;border-radius:9px;
-       color:#8888cc;font-size:.82rem;padding:9px;text-align:center;
-       text-decoration:none;transition:all .15s}
-.nav a:hover,.nav a.active{background:#222244;border-color:#5555aa;color:#aaaaee}
-.preview{background:#111;border-radius:10px;padding:16px;margin-bottom:22px;text-align:center}
-.preview .time{font-size:2.2rem;font-weight:700;color:#4f8fff;letter-spacing:.05em}
-.preview .date{font-size:.9rem;color:#888;margin-top:4px}
-label{display:block;font-size:.78rem;color:#aaa;margin-bottom:5px;
-      text-transform:uppercase;letter-spacing:.05em}
+     display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:16px;padding:28px;width:100%;max-width:380px}
+h1{font-size:1.4rem;font-weight:700;margin-bottom:4px}
+.sub{font-size:.82rem;color:#888;margin-bottom:18px}
+.nav{display:flex;gap:8px;margin-bottom:18px}
+.nav a{flex:1;background:#111;border:1px solid #333;border-radius:8px;color:#888;
+       font-size:.8rem;padding:9px;text-align:center;text-decoration:none;transition:all .15s}
+.nav a.active,.nav a:hover{background:#1a1a3a;border-color:#445;color:#aaf}
+.preview{background:#111;border-radius:10px;padding:14px;margin-bottom:20px;text-align:center}
+.preview .time{font-size:2rem;font-weight:700;color:#4f8fff}
+.preview .date{font-size:.85rem;color:#888;margin-top:4px}
+label{display:block;font-size:.75rem;color:#aaa;margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em}
 input{width:100%;background:#111;border:1px solid #333;border-radius:8px;color:#fff;
-      font-size:1rem;padding:10px 14px;margin-bottom:18px;outline:none}
+      font-size:1rem;padding:10px 12px;margin-bottom:14px;outline:none}
 input:focus{border-color:#4f8fff}
-button{width:100%;background:#4f8fff;border:none;border-radius:10px;color:#fff;
-       font-size:1.05rem;font-weight:600;padding:14px;cursor:pointer}
+.tz{background:#0a0a1a;border:1px solid #223;border-radius:8px;padding:10px 12px;
+    font-size:.82rem;color:#6688aa;margin-bottom:14px}
+button{width:100%;background:#2255cc;border:none;border-radius:10px;color:#fff;
+       font-size:1rem;font-weight:600;padding:13px;cursor:pointer}
 button:disabled{background:#333;color:#666}
-.ok{display:none;margin-top:16px;background:#0d2e0d;border:1px solid #2d6a2d;
-    border-radius:10px;padding:14px;text-align:center;color:#5de85d;font-weight:600}
-</style>
-</head>
-<body>
+.ok{display:none;margin-top:14px;background:#0d2e0d;border:1px solid #1d5a1d;
+    border-radius:10px;padding:12px;text-align:center;color:#5de85d;font-weight:600}
+</style></head><body>
 <div class="card">
-  <h1>&#128337; StudyMate</h1>
-  <p class="sub">Connected to StudyMate-Setup</p>
-  <div class="nav">
-    <a href="/" class="active">&#9200; Time Sync</a>
-    <a href="/setup">&#9881; Setup</a>
-  </div>
-  <div class="preview">
-    <div class="time" id="liveTime">--:-- --</div>
-    <div class="date" id="liveDate">Loading...</div>
-  </div>
-  <label>Date</label><input type="date" id="dateInput">
-  <label>Time</label><input type="time" id="timeInput" step="1">
-  <button onclick="syncTime()">&#9654; Sync Time to Device</button>
-  <div class="ok" id="okMsg">&#10003; Synced! You can close this page.</div>
+<h1>&#9200; StudyMate</h1>
+<p class="sub">Connected to StudyMate-Setup</p>
+<div class="nav">
+  <a href="/" class="active">&#9200; Time</a>
+  <a href="/setup">&#9881; Setup</a>
+  <a href="/alarms">&#128276; Alarms</a>
+</div>
+<div class="preview">
+  <div class="time" id="lt">--:-- --</div>
+  <div class="date" id="ld">Loading...</div>
+</div>
+<label>Date</label><input type="date" id="di">
+<label>Time</label><input type="time" id="ti" step="1">
+<div class="tz" id="tzInfo">Detecting timezone...</div>
+<button onclick="sync()">&#9654; Sync Time to Device</button>
+<div class="ok" id="ok">&#10003; Synced! Time is now correct.</div>
 </div>
 <script>
 var days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
 var months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function pad(n){return String(n).padStart(2,'0');}
+// tzOffset in minutes: positive = ahead of UTC (e.g. Lagos=60)
+var tzOffsetMin = -new Date().getTimezoneOffset();
+var tzLabel = 'UTC' + (tzOffsetMin>=0?'+':'') + (tzOffsetMin/60).toFixed(1).replace('.0','');
+document.getElementById('tzInfo').textContent =
+  'Timezone: ' + Intl.DateTimeFormat().resolvedOptions().timeZone +
+  ' (' + tzLabel + ')  — will be sent to device';
 function fillNow(){var d=new Date();
-  document.getElementById('dateInput').value=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
-  document.getElementById('timeInput').value=pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}
+  document.getElementById('di').value=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
+  document.getElementById('ti').value=pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}
 function updatePreview(){var d=new Date(),h=d.getHours(),m=d.getMinutes(),s=d.getSeconds();
   var ap=h<12?'AM':'PM',h12=h%12||12;
-  document.getElementById('liveTime').textContent=pad(h12)+':'+pad(m)+':'+pad(s)+' '+ap;
-  document.getElementById('liveDate').textContent=days[d.getDay()]+', '+d.getDate()+' '+months[d.getMonth()]+' '+d.getFullYear();}
+  document.getElementById('lt').textContent=pad(h12)+':'+pad(m)+':'+pad(s)+' '+ap;
+  document.getElementById('ld').textContent=days[d.getDay()]+', '+d.getDate()+' '+months[d.getMonth()]+' '+d.getFullYear();}
 fillNow();setInterval(updatePreview,1000);updatePreview();
-function syncTime(){var dv=document.getElementById('dateInput').value,tv=document.getElementById('timeInput').value;
-  if(!dv||!tv){alert('Please fill in date and time.');return;}
+function sync(){
+  var dv=document.getElementById('di').value,tv=document.getElementById('ti').value;
+  if(!dv||!tv){alert('Fill in date and time.');return;}
   var dp=dv.split('-'),tp=tv.split(':');
-  var epoch=Math.floor(new Date(dp[0],dp[1]-1,dp[2],tp[0],tp[1],tp[2]||0).getTime()/1000);
-  fetch('/settime?epoch='+epoch).then(function(r){return r.text();}).then(function(){
-    document.getElementById('okMsg').style.display='block';
-    document.querySelector('button').disabled=true;
-  }).catch(function(){alert('Connection error.');});}
-</script>
-</body>
-</html>
+  // Build a Date from local components, get UTC epoch
+  var localDate=new Date(dp[0],dp[1]-1,dp[2],tp[0],tp[1],tp[2]||0);
+  var epoch=Math.floor(localDate.getTime()/1000);
+  // tzOffsetMin: e.g. 60 for Lagos UTC+1
+  fetch('/settime?epoch='+epoch+'&tz='+tzOffsetMin)
+    .then(function(r){return r.text();}).then(function(){
+      document.getElementById('ok').style.display='block';
+      document.querySelector('button').disabled=true;
+    }).catch(function(){alert('Error. Are you on StudyMate-Setup WiFi?');});
+}
+</script></body></html>
+)rawhtml";
+
+// ── Setup page ───────────────────────────────────────────────
+const char SETUP_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StudyMate Setup</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#0a0a0f;color:#e8e8f0;min-height:100vh;padding:0 0 70px}
+header{background:#111128;border-bottom:1px solid #222244;padding:16px 20px;display:flex;align-items:center;gap:10px}
+header h1{font-size:1.2rem;font-weight:700}
+.nav{display:flex;gap:8px;padding:14px 16px 0}
+.nav a{background:#111;border:1px solid #333;border-radius:8px;color:#888;
+       font-size:.8rem;padding:8px 14px;text-decoration:none;transition:all .15s}
+.nav a.active,.nav a:hover{background:#1a1a3a;border-color:#445;color:#aaf}
+.container{max-width:600px;margin:0 auto;padding:16px}
+.section{background:#111128;border:1px solid #1e1e40;border-radius:12px;margin-bottom:18px;overflow:hidden}
+.sh{padding:12px 16px;background:#161635;border-bottom:1px solid #1e1e40;
+    display:flex;justify-content:space-between;align-items:center}
+.sh h2{font-size:.9rem;font-weight:600;color:#9090d0}
+.badge{font-size:.7rem;background:#0d0d2a;color:#6668aa;border:1px solid #2a2a55;border-radius:12px;padding:2px 8px}
+.sessions{display:flex;gap:10px;padding:16px}
+.si{flex:1;display:flex;flex-direction:column;gap:5px}
+.si label{font-size:.7rem;color:#8888aa;text-transform:uppercase;letter-spacing:.06em}
+.si input{background:#0d0d22;border:1px solid #2a2a55;border-radius:7px;color:#fff;
+          font-size:1.1rem;font-weight:600;padding:9px;text-align:center;width:100%;outline:none}
+.si input:focus{border-color:#5555cc}
+.si .unit{font-size:.68rem;color:#6668aa;text-align:center;margin-top:2px}
+.ex-row{display:grid;grid-template-columns:22px 1fr 78px 34px;align-items:center;
+        gap:8px;padding:9px 14px;border-bottom:1px solid #1a1a38}
+.ex-row:last-child{border-bottom:none}
+.ex-num{font-size:.7rem;color:#4444aa;font-weight:700;text-align:center}
+.ex-row input[type=text]{background:#0d0d22;border:1px solid #22224a;border-radius:6px;
+                          color:#e0e0ff;font-size:.88rem;padding:7px 9px;width:100%;outline:none}
+.ex-row input[type=text]:focus{border-color:#5555cc}
+.dw{display:flex;align-items:center;gap:4px}
+.dw input[type=number]{background:#0d0d22;border:1px solid #22224a;border-radius:6px;
+                        color:#7adfaa;font-size:.88rem;font-weight:600;padding:7px 5px;
+                        width:50px;text-align:center;outline:none}
+.dw span{font-size:.68rem;color:#5566aa}
+.del-btn{background:none;border:1px solid #331122;border-radius:5px;color:#885566;
+         font-size:.82rem;cursor:pointer;padding:5px 7px;transition:all .15s}
+.del-btn:hover{background:#220011;border-color:#aa2244;color:#ff4466}
+.add-btn{display:flex;align-items:center;gap:8px;margin:10px 14px;background:#0d1a22;
+         border:1px dashed #224433;border-radius:8px;color:#448866;font-size:.82rem;
+         padding:9px 12px;cursor:pointer;width:calc(100% - 28px);justify-content:center;transition:all .15s}
+.add-btn:hover{background:#0d2218;border-color:#336644;color:#66cc99}
+.footer{position:fixed;bottom:0;left:0;right:0;background:#0d0d20;border-top:1px solid #1e1e40;
+        padding:10px 14px;display:flex;gap:8px;max-width:600px;margin:0 auto}
+.btn-save{flex:1;background:#2233aa;border:none;border-radius:9px;color:#fff;
+          font-size:.92rem;font-weight:700;padding:12px;cursor:pointer}
+.btn-save:disabled{background:#222244;color:#555577}
+.btn-reset{background:#1a0d0d;border:1px solid #331111;border-radius:9px;color:#774444;
+           font-size:.82rem;padding:12px 14px;cursor:pointer;white-space:nowrap}
+.btn-reset:hover{background:#220000;color:#ff6666}
+.toast{position:fixed;top:18px;left:50%;transform:translateX(-50%) translateY(-80px);
+       background:#0d2e1a;border:1px solid #1d6040;border-radius:10px;padding:10px 20px;
+       color:#4ddd90;font-weight:600;font-size:.88rem;transition:transform .3s;z-index:999;white-space:nowrap}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.total{padding:6px 16px 12px;font-size:.73rem;color:#5566aa}
+.total span{color:#8899cc;font-weight:600}
+</style></head><body>
+<header><h1>&#9881; StudyMate Setup</h1></header>
+<div class="nav">
+  <a href="/">&#9200; Time</a>
+  <a href="/setup" class="active">&#9881; Setup</a>
+  <a href="/alarms">&#128276; Alarms</a>
+</div>
+<div class="container">
+  <div class="section">
+    <div class="sh"><h2>Study Session Durations</h2><span class="badge">minutes</span></div>
+    <div class="sessions">
+      <div class="si"><label>Option 1</label><input type="number" id="s0" min="1" max="180"><div class="unit">min</div></div>
+      <div class="si"><label>Option 2</label><input type="number" id="s1" min="1" max="180"><div class="unit">min</div></div>
+      <div class="si"><label>Option 3</label><input type="number" id="s2" min="1" max="180"><div class="unit">min</div></div>
+    </div>
+  </div>
+  <div class="section">
+    <div class="sh"><h2>Exercise Routine</h2><span class="badge" id="badge">--</span></div>
+    <div id="exList"></div>
+    <button class="add-btn" onclick="addEx()">+ Add Exercise</button>
+    <div class="total" id="totalDiv"></div>
+  </div>
+</div>
+<div class="footer">
+  <button class="btn-reset" onclick="resetDef()">&#8635; Reset</button>
+  <button class="btn-save" id="saveBtn" onclick="saveAll()">Save to Device</button>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var exercises=[];
+function toast(msg,ok){
+  var t=document.getElementById('toast');
+  t.textContent=(ok?'✓ ':'⚠ ')+msg;
+  t.style.background=ok?'#0d2e1a':'#2e1a0d';
+  t.style.color=ok?'#4ddd90':'#ffaa44';
+  t.classList.add('show');
+  setTimeout(function(){t.classList.remove('show');},2500);
+}
+function updateTotal(){
+  var tot=0; exercises.forEach(function(e){tot+=parseInt(e.dur)||0;});
+  var m=Math.floor(tot/60),s=tot%60;
+  document.getElementById('badge').textContent=exercises.length+' exercises';
+  document.getElementById('totalDiv').innerHTML='Total: <span>'+m+'m'+(s>0?' '+s+'s':'')+'</span>';
+}
+function render(){
+  var el=document.getElementById('exList');el.innerHTML='';
+  exercises.forEach(function(ex,i){
+    var row=document.createElement('div');row.className='ex-row';
+    row.innerHTML='<div class="ex-num">'+(i+1)+'</div>'+
+      '<input type="text" maxlength="20" value="'+esc(ex.name)+'" oninput="exercises['+i+'].name=this.value">'+
+      '<div class="dw"><input type="number" min="5" max="600" value="'+ex.dur+'" oninput="exercises['+i+'].dur=parseInt(this.value)||30;updateTotal()"><span>sec</span></div>'+
+      '<button class="del-btn" onclick="delEx('+i+')">&#10005;</button>';
+    el.appendChild(row);
+  });
+  updateTotal();
+}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
+function addEx(){if(exercises.length>=20){toast('Max 20',false);return;}exercises.push({name:'Exercise',dur:30});render();}
+function delEx(i){if(exercises.length<=1){toast('Need at least 1',false);return;}exercises.splice(i,1);render();}
+function resetDef(){if(!confirm('Reset to factory defaults?'))return;
+  fetch('/defaults').then(function(r){return r.json();}).then(function(d){apply(d);toast('Reset to defaults',true);});}
+function apply(d){
+  document.getElementById('s0').value=d.s[0];
+  document.getElementById('s1').value=d.s[1];
+  document.getElementById('s2').value=d.s[2];
+  exercises=d.exercises.map(function(e){return{name:e.name,dur:e.dur};});render();}
+function saveAll(){
+  var btn=document.getElementById('saveBtn');btn.disabled=true;btn.textContent='Saving...';
+  var p={s:[parseInt(document.getElementById('s0').value)||10,
+            parseInt(document.getElementById('s1').value)||30,
+            parseInt(document.getElementById('s2').value)||60],
+         exercises:exercises.map(function(e){return{name:e.name.trim()||'Exercise',dur:parseInt(e.dur)||30};})};
+  fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)})
+    .then(function(r){return r.text();}).then(function(){
+      toast('Saved!',true);btn.textContent='Saved ✓';
+    }).catch(function(){toast('Save failed',false);btn.disabled=false;btn.textContent='Save to Device';});
+}
+fetch('/config.json').then(function(r){return r.json();}).then(apply);
+</script></body></html>
+)rawhtml";
+
+// ── Alarms page ──────────────────────────────────────────────
+const char ALARMS_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StudyMate Alarms</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#0a0a0f;color:#e8e8f0;min-height:100vh;padding:0 0 80px}
+header{background:#111128;border-bottom:1px solid #222244;padding:16px 20px}
+header h1{font-size:1.2rem;font-weight:700}
+.nav{display:flex;gap:8px;padding:14px 16px 0}
+.nav a{background:#111;border:1px solid #333;border-radius:8px;color:#888;
+       font-size:.8rem;padding:8px 14px;text-decoration:none;transition:all .15s}
+.nav a.active,.nav a:hover{background:#1a1a3a;border-color:#445;color:#aaf}
+.container{max-width:600px;margin:0 auto;padding:16px}
+.alarm-card{background:#111128;border:1px solid #1e1e40;border-radius:12px;
+            margin-bottom:12px;overflow:hidden}
+.alarm-head{padding:12px 14px;display:flex;justify-content:space-between;align-items:center;
+            border-bottom:1px solid #1a1a38}
+.alarm-label input{background:none;border:none;color:#ccd;font-size:.95rem;font-weight:600;
+                    outline:none;width:160px}
+.toggle{position:relative;width:44px;height:24px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.slider{position:absolute;top:0;left:0;right:0;bottom:0;background:#222;border-radius:24px;cursor:pointer;transition:.3s}
+.slider:before{position:absolute;content:'';height:18px;width:18px;left:3px;bottom:3px;
+               background:#555;border-radius:50%;transition:.3s}
+.toggle input:checked+.slider{background:#2255cc}
+.toggle input:checked+.slider:before{transform:translateX(20px);background:#fff}
+.alarm-body{padding:12px 14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.alarm-body label{font-size:.7rem;color:#6668aa;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:3px}
+.time-in{background:#0d0d22;border:1px solid #22224a;border-radius:7px;color:#7adfaa;
+          font-size:1.1rem;font-weight:700;padding:8px 10px;outline:none;width:110px}
+.time-in:focus{border-color:#5555cc}
+select{background:#0d0d22;border:1px solid #22224a;border-radius:7px;color:#ccd;
+       font-size:.85rem;padding:8px 10px;outline:none;cursor:pointer}
+select:focus{border-color:#5555cc}
+.del-btn{margin-left:auto;background:none;border:1px solid #331122;border-radius:6px;
+         color:#774455;font-size:.82rem;cursor:pointer;padding:7px 10px;transition:all .15s}
+.del-btn:hover{background:#220011;color:#ff4466}
+.add-btn{display:flex;align-items:center;gap:8px;background:#0d1a22;
+         border:1px dashed #224433;border-radius:9px;color:#448866;font-size:.85rem;
+         padding:11px 14px;cursor:pointer;width:100%;justify-content:center;margin-top:4px;transition:all .15s}
+.add-btn:hover{background:#0d2218;color:#66cc99}
+.footer{position:fixed;bottom:0;left:0;right:0;background:#0d0d20;border-top:1px solid #1e1e40;
+        padding:10px 14px;display:flex;gap:8px;max-width:600px;margin:0 auto}
+.btn-save{flex:1;background:#2233aa;border:none;border-radius:9px;color:#fff;
+          font-size:.92rem;font-weight:700;padding:12px;cursor:pointer}
+.btn-save:disabled{background:#222244;color:#555577}
+.toast{position:fixed;top:18px;left:50%;transform:translateX(-50%) translateY(-80px);
+       background:#0d2e1a;border:1px solid #1d6040;border-radius:10px;padding:10px 20px;
+       color:#4ddd90;font-weight:600;font-size:.88rem;transition:transform .3s;z-index:999;white-space:nowrap}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.empty{text-align:center;color:#444;padding:40px 20px;font-size:.9rem}
+</style></head><body>
+<header><h1>&#128276; Alarms</h1></header>
+<div class="nav">
+  <a href="/">&#9200; Time</a>
+  <a href="/setup">&#9881; Setup</a>
+  <a href="/alarms" class="active">&#128276; Alarms</a>
+</div>
+<div class="container">
+  <div id="alarmList"></div>
+  <button class="add-btn" onclick="addAlarm()">+ Add Alarm</button>
+</div>
+<div class="footer">
+  <button class="btn-save" id="saveBtn" onclick="saveAlarms()">Save Alarms</button>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var alarms=[];
+var DAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+function toast(msg,ok){
+  var t=document.getElementById('toast');
+  t.textContent=(ok?'✓ ':'⚠ ')+msg;
+  t.style.background=ok?'#0d2e1a':'#2e1a0d';t.style.color=ok?'#4ddd90':'#ffaa44';
+  t.classList.add('show');setTimeout(function(){t.classList.remove('show');},2500);}
+function render(){
+  var el=document.getElementById('alarmList');el.innerHTML='';
+  if(alarms.length===0){el.innerHTML='<div class="empty">No alarms yet. Tap + to add one.</div>';return;}
+  alarms.forEach(function(al,i){
+    var card=document.createElement('div');card.className='alarm-card';
+    var dayOpts=DAYS.map(function(d,j){return'<option value="'+j+'"'+(al.dow==j?' selected':'')+'>'+d+'</option>';}).join('');
+    card.innerHTML=
+      '<div class="alarm-head">'+
+        '<div class="alarm-label"><input type="text" maxlength="18" value="'+esc(al.label)+'" oninput="alarms['+i+'].label=this.value" placeholder="Alarm label"></div>'+
+        '<label class="toggle"><input type="checkbox"'+(al.enabled?' checked':'')+' onchange="alarms['+i+'].enabled=this.checked"><span class="slider"></span></label>'+
+      '</div>'+
+      '<div class="alarm-body">'+
+        '<div><label>Time</label><input type="time" class="time-in" value="'+pad(al.hour)+':'+pad(al.minute)+'" onchange="setTime('+i+',this.value)"></div>'+
+        '<div><label>Repeat</label>'+
+          '<select onchange="alarms['+i+'].type=parseInt(this.value);render()">'+
+            '<option value="0"'+(al.type==0?' selected':'')+'>Once</option>'+
+            '<option value="1"'+(al.type==1?' selected':'')+'>Daily</option>'+
+            '<option value="2"'+(al.type==2?' selected':'')+'>Weekly</option>'+
+          '</select>'+
+        '</div>'+
+        (al.type!=1?'<div><label>'+(al.type==0?'On day':'Day of week')+'</label><select onchange="alarms['+i+'].dow=parseInt(this.value)">'+dayOpts+'</select></div>':'')+
+        '<button class="del-btn" onclick="delAlarm('+i+')">&#10005; Remove</button>'+
+      '</div>';
+    el.appendChild(card);
+  });
+}
+function pad(n){return String(n).padStart(2,'0');}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
+function setTime(i,v){var p=v.split(':');alarms[i].hour=parseInt(p[0]);alarms[i].minute=parseInt(p[1]);}
+function addAlarm(){
+  if(alarms.length>=10){toast('Max 10 alarms',false);return;}
+  var now=new Date();
+  alarms.push({label:'Alarm '+(alarms.length+1),enabled:true,type:1,hour:now.getHours(),minute:now.getMinutes(),dow:now.getDay()});
+  render();
+}
+function delAlarm(i){alarms.splice(i,1);render();}
+function saveAlarms(){
+  var btn=document.getElementById('saveBtn');btn.disabled=true;btn.textContent='Saving...';
+  fetch('/savealarms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(alarms)})
+    .then(function(r){return r.text();}).then(function(){
+      toast('Alarms saved!',true);btn.textContent='Saved ✓';setTimeout(function(){btn.disabled=false;btn.textContent='Save Alarms';},2000);
+    }).catch(function(){toast('Save failed',false);btn.disabled=false;btn.textContent='Save Alarms';});
+}
+fetch('/alarms.json').then(function(r){return r.json();}).then(function(d){alarms=d;render();});
+</script></body></html>
 )rawhtml";
 
 
 // ════════════════════════════════════════════════════════════
-//  WEB SERVER HANDLERS
+//  WEB HANDLERS
 // ════════════════════════════════════════════════════════════
+void handleRoot()       { server.send_P(200,"text/html",TIME_HTML); }
+void handleSetupPage()  { server.send_P(200,"text/html",SETUP_HTML); }
+void handleAlarmsPage() { server.send_P(200,"text/html",ALARMS_HTML); }
+void handleNotFound()   { server.sendHeader("Location","http://192.168.4.1",true); server.send(302,"text/plain",""); }
 
-void handleRoot()      { server.send_P(200,"text/html",TIME_HTML); }
-void handleSetupPage() { server.send_P(200,"text/html",SETUP_HTML); }
-void handleNotFound()  { server.sendHeader("Location","http://192.168.4.1",true); server.send(302,"text/plain",""); }
-
+// TIME SYNC — now receives epoch (UTC-based local) + tz offset
 void handleSetTime() {
   if (!server.hasArg("epoch")) { server.send(400,"text/plain","Missing epoch"); return; }
-  time_t epoch=(time_t)server.arg("epoch").toInt();
-  if (timeSource==TS_RTC||rtc.begin()) { rtc.adjust(DateTime((uint32_t)epoch)); timeSource=TS_RTC; }
-  swEpoch=epoch; swMillis=millis();
+
+  // epoch from browser = local epoch (built from local date/time components)
+  // tz = offset in minutes (e.g. 60 for UTC+1)
+  // We store epoch as-is (local time) — decodeEpoch uses gmtime_r which gives correct local time
+  time_t epoch = (time_t)server.arg("epoch").toInt();
+  int32_t tzMin = server.hasArg("tz") ? server.arg("tz").toInt() : 0;
+  g_tzOffsetSec = tzMin * 60;
+
+  // Store to RTC if available — RTC stores local time directly
+  if (timeSource==TS_RTC || rtc.begin()) {
+    DateTime dt(epoch);   // RTClib treats this as-is
+    rtc.adjust(dt);
+    timeSource = TS_RTC;
+  }
+  swEpoch  = epoch;
+  swMillis = millis();
   if (timeSource==TS_NONE) timeSource=TS_SOFTWARE;
-  timeSynced=true;
+
+  // Persist timezone for future reboots
+  timeSynced = true;
+  prefs.begin("sm",false); prefs.putInt("tz",(int)g_tzOffsetSec); prefs.end();
+
   server.send(200,"text/plain","OK");
 }
 
-// GET /config.json — returns current runtime config as JSON
+// CONFIG JSON
 void handleConfigJson() {
-  String json = "{\"s\":[";
-  json += sessionMins[0]; json += ",";
-  json += sessionMins[1]; json += ",";
-  json += sessionMins[2]; json += "],\"exercises\":[";
-  for (int i=0; i<numExercises; i++) {
-    if (i>0) json += ",";
-    json += "{\"name\":\"";
-    // escape quotes in name
-    for (int c=0; exList[i].name[c]; c++) {
-      char ch = exList[i].name[c];
-      if (ch=='"') json += "\\\""; else json += ch;
-    }
-    json += "\",\"dur\":"; json += exList[i].durationSec; json += "}";
+  String j="{\"s\":["; j+=sessionMins[0];j+=",";j+=sessionMins[1];j+=",";j+=sessionMins[2];j+="],\"exercises\":[";
+  for(int i=0;i<numExercises;i++){
+    if(i>0)j+=","; j+="{\"name\":\"";
+    for(int c=0;exList[i].name[c];c++){char ch=exList[i].name[c];if(ch=='"')j+="\\\"";else j+=ch;}
+    j+="\",\"dur\":";j+=exList[i].durationSec;j+="}";
   }
-  json += "]}";
-  server.send(200,"application/json",json);
+  j+="]}";
+  server.send(200,"application/json",j);
 }
 
-// GET /defaults — returns factory defaults as JSON (does NOT save)
+// DEFAULTS JSON
 void handleDefaults() {
-  const char* dNames[] = {
-    "Get Ready!","Jack Squats","Push-Ups","Caterpillars",
-    "Inch Worms","Elbow Plank","Cat Stretch","Wats Up Dawg",
-    "Heel Tap Crunch","Hip Thrust","Squat+Calf Raise",
-    "Eagle Walks","Upright Plank","Hamstring Stretch",
-    "Superman Strokes","Neg. Push-Ups","Hip Stretch Lunge",
-    "Squat Taps","Jumping Jacks"
-  };
-  const int dDur[]={27,30,30,30,30,30,30,30,30,30,60,30,30,60,30,30,30,30,30};
-  String json="{\"s\":[10,30,60],\"exercises\":[";
-  for (int i=0;i<19;i++){
-    if(i>0)json+=",";
-    json+="{\"name\":\""; json+=dNames[i]; json+="\",\"dur\":"; json+=dDur[i]; json+="}";
-  }
-  json+="]}";
-  server.send(200,"application/json",json);
+  const char*dN[]={"Get Ready!","Jack Squats","Push-Ups","Caterpillars","Inch Worms",
+    "Elbow Plank","Cat Stretch","Wats Up Dawg","Heel Tap Crunch","Hip Thrust",
+    "Squat+Calf Raise","Eagle Walks","Upright Plank","Hamstring Stretch",
+    "Superman Strokes","Neg. Push-Ups","Hip Stretch Lunge","Squat Taps","Jumping Jacks"};
+  const int dD[]={27,30,30,30,30,30,30,30,30,30,60,30,30,60,30,30,30,30,30};
+  String j="{\"s\":[10,30,60],\"exercises\":[";
+  for(int i=0;i<19;i++){if(i>0)j+=",";j+="{\"name\":\"";j+=dN[i];j+="\",\"dur\":";j+=dD[i];j+="}";}
+  j+="]}"; server.send(200,"application/json",j);
 }
 
-// POST /save — receives JSON, parses, saves to flash, restarts app state
+// SAVE CONFIG
 void handleSave() {
-  if (!server.hasArg("plain")) { server.send(400,"text/plain","No body"); return; }
-  String body = server.arg("plain");
+  if(!server.hasArg("plain")){server.send(400,"text/plain","No body");return;}
+  String body=server.arg("plain");
+  int si=body.indexOf("\"s\":[");
+  if(si>=0){si+=5;for(int k=0;k<3;k++){int end=body.indexOf(k<2?',':']',si);if(end<0)break;int v=body.substring(si,end).toInt();if(v>=1&&v<=180)sessionMins[k]=v;si=end+1;}}
+  int exCount=0,pos=body.indexOf("\"exercises\":[");
+  if(pos>=0){pos+=13;while(exCount<MAX_EXERCISES){
+    int os=body.indexOf('{',pos);if(os<0)break;int oe=body.indexOf('}',os);if(oe<0)break;
+    String obj=body.substring(os,oe+1);
+    int ni=obj.indexOf("\"name\":\"");String nm="Exercise";
+    if(ni>=0){ni+=8;int ne=ni;while(ne<(int)obj.length()&&!(obj[ne]=='"'&&obj[ne-1]!='\\'))ne++;nm=obj.substring(ni,ne);nm.replace("\\\"","\"");}
+    int di=obj.indexOf("\"dur\":");int dur=30;
+    if(di>=0){di+=6;int de=di;while(de<(int)obj.length()&&obj[de]>='0'&&obj[de]<='9')de++;dur=obj.substring(di,de).toInt();if(dur<5)dur=5;if(dur>600)dur=600;}
+    strncpy(exList[exCount].name,nm.c_str(),MAX_NAME_LEN);exList[exCount].name[MAX_NAME_LEN]='\0';
+    exList[exCount].durationSec=dur;exCount++;pos=oe+1;
+  }}
+  if(exCount>0)numExercises=exCount;
+  computeStartTimes();saveConfig();setupSaved=true;
+  server.send(200,"text/plain","OK");
+}
 
-  // Simple JSON parser — no external library needed
-  // Format: {"s":[10,30,60],"exercises":[{"name":"...","dur":30},...]}
-
-  // Parse session minutes
-  int si = body.indexOf("\"s\":[");
-  if (si >= 0) {
-    si += 5;
-    for (int k=0; k<3; k++) {
-      int end = body.indexOf(k<2?',':']', si);
-      if (end<0) break;
-      int val = body.substring(si,end).toInt();
-      if (val>=1&&val<=180) sessionMins[k]=val;
-      si = end+1;
-    }
+// ALARMS JSON
+void handleAlarmsJson() {
+  String j="[";
+  for(int i=0;i<numAlarms;i++){
+    if(i>0)j+=",";
+    j+="{\"label\":\"";
+    for(int c=0;alarms[i].label[c];c++){char ch=alarms[i].label[c];if(ch=='"')j+="\\\"";else j+=ch;}
+    j+="\",\"enabled\":"+(alarms[i].enabled?String("true"):String("false"));
+    j+=",\"type\":";j+=alarms[i].type;
+    j+=",\"hour\":";j+=alarms[i].hour;
+    j+=",\"minute\":";j+=alarms[i].minute;
+    j+=",\"dow\":";j+=alarms[i].dayOfWeek;j+="}";
   }
+  j+="]"; server.send(200,"application/json",j);
+}
 
-  // Parse exercises
-  int exCount = 0;
-  int pos = body.indexOf("\"exercises\":[");
-  if (pos >= 0) {
-    pos += 13;
-    while (exCount < MAX_EXERCISES) {
-      int objStart = body.indexOf('{', pos);
-      if (objStart < 0) break;
-      int objEnd   = body.indexOf('}', objStart);
-      if (objEnd   < 0) break;
-      String obj   = body.substring(objStart, objEnd+1);
+// SAVE ALARMS
+void handleSaveAlarms() {
+  if(!server.hasArg("plain")){server.send(400,"text/plain","No body");return;}
+  String body=server.arg("plain");
+  int count=0,pos=0;
+  while(count<MAX_ALARMS){
+    int os=body.indexOf('{',pos);if(os<0)break;int oe=body.indexOf('}',os);if(oe<0)break;
+    String obj=body.substring(os,oe+1);
+    // parse each field
+    auto getStr=[&](const char*key)->String{
+      int p=obj.indexOf(key);if(p<0)return "";p+=strlen(key);
+      if(obj[p]=='"'){p++;int e=p;while(e<(int)obj.length()&&!(obj[e]=='"'&&obj[e-1]!='\\'))e++;return obj.substring(p,e);}
+      return "";
+    };
+    auto getInt=[&](const char*key)->int{
+      int p=obj.indexOf(key);if(p<0)return 0;p+=strlen(key);
+      while(p<(int)obj.length()&&(obj[p]==' '||obj[p]=='"'))p++;
+      int e=p;while(e<(int)obj.length()&&(obj[e]>='0'&&obj[e]<='9'))e++;
+      return obj.substring(p,e).toInt();
+    };
+    auto getBool=[&](const char*key)->bool{int p=obj.indexOf(key);if(p<0)return false;return obj.indexOf("true",p+strlen(key))>=0;};
 
-      // name
-      int ni = obj.indexOf("\"name\":\"");
-      String nm = "Exercise";
-      if (ni >= 0) {
-        ni += 8;
-        int ne = ni;
-        while (ne < (int)obj.length() && !(obj[ne]=='"' && obj[ne-1]!='\\')) ne++;
-        nm = obj.substring(ni, ne);
-        nm.replace("\\\"","\"");
-      }
-      // dur
-      int di = obj.indexOf("\"dur\":");
-      int dur = 30;
-      if (di >= 0) {
-        di += 6;
-        int de = di;
-        while (de<(int)obj.length()&&(obj[de]>='0'&&obj[de]<='9')) de++;
-        dur = obj.substring(di,de).toInt();
-        if (dur<5)  dur=5;
-        if (dur>600) dur=600;
-      }
-
-      strncpy(exList[exCount].name, nm.c_str(), MAX_NAME_LEN);
-      exList[exCount].name[MAX_NAME_LEN]='\0';
-      exList[exCount].durationSec = dur;
-      exCount++;
-      pos = objEnd + 1;
-    }
+    String lbl=getStr("\"label\":\""); lbl.replace("\\\"","\"");
+    if(lbl.length()==0)lbl="Alarm";
+    strncpy(alarms[count].label,lbl.c_str(),ALARM_LABEL_LEN); alarms[count].label[ALARM_LABEL_LEN]='\0';
+    alarms[count].enabled  =getBool("\"enabled\":");
+    alarms[count].type     =(uint8_t)getInt("\"type\":");
+    alarms[count].hour     =(uint8_t)getInt("\"hour\":");
+    alarms[count].minute   =(uint8_t)getInt("\"minute\":");
+    alarms[count].dayOfWeek=(uint8_t)getInt("\"dow\":");
+    count++;pos=oe+1;
   }
-
-  if (exCount > 0) numExercises = exCount;
-  computeStartTimes();
-  saveConfig();
-  setupSaved = true;
-
+  numAlarms=count;
+  saveAlarms();
   server.send(200,"text/plain","OK");
 }
 
@@ -794,193 +934,160 @@ void handleSave() {
 // ════════════════════════════════════════════════════════════
 //  HOTSPOT
 // ════════════════════════════════════════════════════════════
-void startHotspot() {
+void startHotspot(){
   WiFi.mode(WIFI_AP);
-  if (strlen(AP_PASS)>0) WiFi.softAP(AP_SSID,AP_PASS); else WiFi.softAP(AP_SSID);
+  if(strlen(AP_PASS)>0)WiFi.softAP(AP_SSID,AP_PASS);else WiFi.softAP(AP_SSID);
   IPAddress ip(192,168,4,1),gw(192,168,4,1),sn(255,255,255,0);
   WiFi.softAPConfig(ip,gw,sn);
-  server.on("/",          handleRoot);
-  server.on("/setup",     handleSetupPage);
+  server.on("/",           handleRoot);
+  server.on("/setup",      handleSetupPage);
+  server.on("/alarms",     handleAlarmsPage);
   server.on("/config.json",handleConfigJson);
-  server.on("/defaults",  handleDefaults);
-  server.on("/settime",   handleSetTime);
-  server.on("/save",      HTTP_POST, handleSave);
-  server.onNotFound(      handleNotFound);
+  server.on("/alarms.json",handleAlarmsJson);
+  server.on("/defaults",   handleDefaults);
+  server.on("/settime",    handleSetTime);
+  server.on("/save",       HTTP_POST,handleSave);
+  server.on("/savealarms", HTTP_POST,handleSaveAlarms);
+  server.onNotFound(       handleNotFound);
   server.begin();
 }
-
-void stopHotspot() {
-  server.stop();
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_OFF);
-}
+void stopHotspot(){server.stop();WiFi.softAPdisconnect(true);WiFi.mode(WIFI_OFF);}
 
 
 // ════════════════════════════════════════════════════════════
 //  SCREENS
 // ════════════════════════════════════════════════════════════
-
-void drawSplash() {
-  slots_Done(); lcd.clear();
-  lcd.setCursor(4,1); lcd.write(4); lcd.print(" StudyMate "); lcd.write(4);
+void drawSplash(){
+  slots_Done();lcd.clear();
+  lcd.setCursor(4,1);lcd.write(4);lcd.print(" StudyMate ");lcd.write(4);
   printCenter(2,"Your Focus Partner");
 }
-
-void drawTimeSyncAP() {
-  slots_Sync(); lcd.clear();
+void drawTimeSyncAP(){
+  slots_Sync();lcd.clear();
   printCenter(0,"---  Set Time  ---");
   printCenter(1,"WiFi: StudyMate-Setup");
   printCenter(2,"Go: 192.168.4.1");
-  lcd.setCursor(3,3); lcd.print("[B]"); lcd.write(7); lcd.print("  to skip");
+  lcd.setCursor(3,3);lcd.print("[B]");lcd.write(7);lcd.print("  to skip");
 }
-
-void drawSyncDone() {
-  slots_Sync(); lcd.clear();
+void drawSyncDone(){
+  slots_Sync();lcd.clear();
   printCenter(0,"---  Synced!  ---");
-  lcd.setCursor(6,2); lcd.write(6); lcd.print("  All good!");
+  lcd.setCursor(6,2);lcd.write(6);lcd.print("  All good!");
   printCenter(3,"Starting clock...");
 }
-
-// Setup AP screen
-// ┌────────────────────┐
-// │  >>>  SETUP  <<<   │
-// │  WiFi: StudyMate   │
-// │  Go: 192.168.4.1   │
-// │  [B] ← to exit     │
-// └────────────────────┘
-void drawSetupAP() {
-  slots_Sync(); lcd.clear();
+void drawSetupAP(){
+  slots_Sync();lcd.clear();
   printCenter(0,">>>  SETUP  <<<");
   printCenter(1,"WiFi: StudyMate-Setup");
   printCenter(2,"Go: 192.168.4.1");
-  lcd.setCursor(3,3); lcd.print("[B]"); lcd.write(7); lcd.print("  to exit");
+  lcd.setCursor(3,3);lcd.print("[B]");lcd.write(7);lcd.print("  to exit");
 }
-
-void drawSetupSaved() {
-  slots_Sync(); lcd.clear();
+void drawSetupSaved(){
+  slots_Sync();lcd.clear();
   printCenter(0,"---  Saved!  ---");
-  lcd.setCursor(5,2); lcd.write(6); lcd.print("  Config saved!");
+  lcd.setCursor(5,2);lcd.write(6);lcd.print("  Config saved!");
   printCenter(3,"Reloading...");
 }
 
-// Home clock — big digits
-void drawHomeClock() {
+// HOME CLOCK — big block digits
+void drawHomeClock(){
   decodeEpoch(nowEpoch());
-  slots_BigDigits(); lcd.clear();
-  char datePart[21];
-  snprintf(datePart,21,"%s, %02d %s",DOW_N[ct_dow],ct_day,MON_N[ct_month]);
-  printCenter(0,datePart);
+  slots_BigDigits();lcd.clear();
+  char dp[21];snprintf(dp,21,"%s, %02d %s",DOW_N[ct_dow],ct_day,MON_N[ct_month]);
+  printCenter(0,dp);
   drawBigTime((int)to12h(ct_hour),(int)ct_minute,1);
-  lcd.setCursor(19,1); lcd.print(ct_hour<12?"A":"P");
-  lcd.setCursor(19,2); lcd.print("M");
-  lcd.setCursor(5,3); lcd.print("[A]  >>  menu");
+  lcd.setCursor(19,1);lcd.print(ct_hour<12?"A":"P");
+  lcd.setCursor(19,2);lcd.print("M");
+  lcd.setCursor(5,3);lcd.print("[A]  >>  menu");
 }
 
-// Main menu — now 3 items: Study / Exercise / Settings
+// ALARM POPUP — overlays current screen
 // ┌────────────────────┐
-// │  ====  MENU  ====  │
-// │  ▶  Study Session  │
-// │  □  Exercise Mode  │
-// │  □  Settings       │
+// │ ♪ ALARM ♪          │
+// │   Wake Up!         │
+// │   09 : 30  AM      │
+// │  [A] or [B] dismiss│
 // └────────────────────┘
-// Hint row: A scrolls, B selects — shown on a 4th "virtual" slot.
-// Since we have 3 items across rows 1-3 there is no room for a
-// separate hint row, so hint is embedded in the header as mini icons.
-void drawMainMenu() {
-  slots_Menu(); lcd.clear();
-  // Header with hint embedded right side
-  lcd.setCursor(0,0); lcd.print("====  MENU  ====");
-  lcd.setCursor(16,0); lcd.print("[A]"); lcd.write(5);  // [A]↕
-
-  lcd.setCursor(2,1); lcd.write(menuCursor==0?2:1); lcd.print("  Study Session ");
-  lcd.setCursor(2,2); lcd.write(menuCursor==1?2:1); lcd.print("  Exercise Mode ");
-  lcd.setCursor(2,3); lcd.write(menuCursor==2?2:1); lcd.print("  Settings      ");
+void drawAlarmPopup(){
+  slots_Alarm();lcd.clear();
+  lcd.setCursor(0,0);lcd.write(5);lcd.print("  ALARM  ");lcd.write(5);
+  if(firingAlarmIdx>=0) printCenter(1,alarms[firingAlarmIdx].label);
+  char tp[12];snprintf(tp,12," %02d : %02d  %s",to12h(ct_hour),ct_minute,ampmStr(ct_hour));
+  printCenter(2,tp);
+  printCenter(3,"[A] or [B] dismiss");
 }
 
-// Session select
-void drawSessionSelect() {
-  slots_Session(); lcd.clear();
-  lcd.setCursor(0,0); lcd.print("  STUDY TIME  ");
-  lcd.setCursor(14,0); lcd.print("[A]"); lcd.write(5); lcd.print("[B]"); lcd.write(6);
-  char dur[3][12];
-  snprintf(dur[0],12,"  %d min",sessionMins[0]);
-  snprintf(dur[1],12,"  %d min",sessionMins[1]);
-  snprintf(dur[2],12,"  %d min",sessionMins[2]);
-  for (int i=0;i<3;i++){
-    lcd.setCursor(2,i+1);
-    lcd.write(sessionCursor==i?2:1);
-    lcd.print(dur[i]);
-  }
+// MAIN MENU — 3 items with hint in header
+void drawMainMenu(){
+  slots_Menu();lcd.clear();
+  lcd.setCursor(0,0);lcd.print("====  MENU  ====");
+  lcd.setCursor(16,0);lcd.print("[A]");lcd.write(5);
+  lcd.setCursor(2,1);lcd.write(menuCursor==0?2:1);lcd.print("  Study Session ");
+  lcd.setCursor(2,2);lcd.write(menuCursor==1?2:1);lcd.print("  Exercise Mode ");
+  lcd.setCursor(2,3);lcd.write(menuCursor==2?2:1);lcd.print("  Settings      ");
 }
 
-// Study running — big digits rows 1-2
-void drawStudyRunning() {
+// SESSION SELECT
+void drawSessionSelect(){
+  slots_Session();lcd.clear();
+  lcd.setCursor(0,0);lcd.print("  STUDY TIME  ");
+  lcd.setCursor(14,0);lcd.print("[A]");lcd.write(5);lcd.print("[B]");lcd.write(6);
+  char dur[3][10];
+  snprintf(dur[0],10,"  %d min",sessionMins[0]);
+  snprintf(dur[1],10,"  %d min",sessionMins[1]);
+  snprintf(dur[2],10,"  %d min",sessionMins[2]);
+  for(int i=0;i<3;i++){lcd.setCursor(2,i+1);lcd.write(sessionCursor==i?2:1);lcd.print(dur[i]);}
+}
+
+// STUDY RUNNING — big digits
+void drawStudyRunning(){
   slots_BigDigits();
-  long total=sessionMins[sessionCursor]*60L, remaining=studyTotalSeconds;
+  long total=sessionMins[sessionCursor]*60L,remaining=studyTotalSeconds;
   int filled=(int)(((total-remaining)*16L)/total);
   lcd.clear();
-  lcd.setCursor(0,0); lcd.print(studyPaused?"||   FOCUS MODE    ":">    FOCUS MODE    ");
+  lcd.setCursor(0,0);lcd.print(studyPaused?"||   FOCUS MODE    ":">    FOCUS MODE    ");
   drawBigTime((int)(remaining/60),(int)(remaining%60),1);
-  lcd.setCursor(0,3); lcd.print("[");
-  for(int i=0;i<16;i++) lcd.write(i<filled?0:6);
-  lcd.print("]");
-  lcd.setCursor(19,3); lcd.print(studyPaused?"|":">");
+  lcd.setCursor(0,3);lcd.print("[");
+  for(int i=0;i<16;i++)lcd.write(i<filled?0:6);
+  lcd.print("]");lcd.setCursor(19,3);lcd.print(studyPaused?"|":">");
 }
 
-// Exercise running — big digits rows 2-3
-void drawExerciseRunning() {
+// EXERCISE RUNNING — big digits
+void drawExerciseRunning(){
   slots_BigDigits();
-  int idx=0;
-  for(int i=0;i<numExercises;i++){if(exerciseElapsed>=atSecond[i])idx=i; else break;}
+  int idx=0;for(int i=0;i<numExercises;i++){if(exerciseElapsed>=atSecond[i])idx=i;else break;}
   long remaining=totalExerciseSec()-exerciseElapsed;
   lcd.clear();
-  lcd.setCursor(0,0); lcd.print(exercisePaused?"||  EXERCISE MODE  ":">>  EXERCISE MODE  ");
+  lcd.setCursor(0,0);lcd.print(exercisePaused?"||  EXERCISE MODE  ":">>  EXERCISE MODE  ");
   printCenter(1,exercisePaused?"- - PAUSED - -":exList[idx].name);
   drawBigTime((int)(remaining/60),(int)(remaining%60),2);
 }
 
-// Done screen
-void drawDone() {
-  slots_Done(); lcd.clear();
+// DONE
+void drawDone(){
+  slots_Done();lcd.clear();
   printCenter(0,"- - - - - - - -");
-  lcd.setCursor(2,1); lcd.write(4);
-  lcd.print(doneIsExercise?"  Well Done!   ":"  Session Done!");
-  lcd.write(4);
+  lcd.setCursor(2,1);lcd.write(4);
+  lcd.print(doneIsExercise?"  Well Done!   ":"  Session Done!");lcd.write(4);
   printCenter(2,"Amazing effort :)");
   printCenter(3,"-- Press any btn --");
 }
 
 
 // ════════════════════════════════════════════════════════════
-//  STATE TRANSITIONS
+//  TRANSITIONS
 // ════════════════════════════════════════════════════════════
-void goToHome()     { appState=STATE_HOME_CLOCK; lastClockUpdate=0; drawHomeClock(); }
-void goToMainMenu() { appState=STATE_MAIN_MENU;  menuCursor=0;      drawMainMenu(); }
-
-void startStudy() {
-  studyTotalSeconds=sessionMins[sessionCursor]*60L;
-  studyRunning=true; studyPaused=false; studyPrevMillis=millis();
-  appState=STATE_STUDY_RUNNING; drawStudyRunning();
-}
-
-void startExercise() {
-  exerciseElapsed=0; exerciseRunning=true; exercisePaused=false;
-  exercisePrevMillis=millis();
-  appState=STATE_EXERCISE_RUNNING; drawExerciseRunning();
-}
-
-void startSetupAP() {
-  setupSaved=false;
-  startHotspot();
-  appState=STATE_SETUP_AP;
-  drawSetupAP();
-}
+void goToHome()    {appState=STATE_HOME_CLOCK;lastClockUpdate=0;drawHomeClock();}
+void goToMainMenu(){appState=STATE_MAIN_MENU;menuCursor=0;drawMainMenu();}
+void startStudy()  {studyTotalSeconds=sessionMins[sessionCursor]*60L;studyRunning=true;studyPaused=false;studyPrevMillis=millis();appState=STATE_STUDY_RUNNING;drawStudyRunning();}
+void startExercise(){exerciseElapsed=0;exerciseRunning=true;exercisePaused=false;exercisePrevMillis=millis();appState=STATE_EXERCISE_RUNNING;drawExerciseRunning();}
+void startSetupAP(){setupSaved=false;startHotspot();appState=STATE_SETUP_AP;drawSetupAP();}
 
 
 // ════════════════════════════════════════════════════════════
 //  SETUP
 // ════════════════════════════════════════════════════════════
-void setup() {
+void setup(){
   Serial.begin(115200);
   Wire.begin(4,16);
   pinMode(BTN_A,INPUT_PULLUP);
@@ -988,58 +1095,85 @@ void setup() {
   pinMode(BUZZER_PIN,OUTPUT);
   digitalWrite(BUZZER_PIN,LOW);
 
-  lcd.init();
-  lcd.backlight();
-
-  loadConfig();   // load from flash (or defaults)
+  lcd.init();lcd.backlight();
+  loadConfig();
 
   slots_Done();
   drawSplash();
   sfx_BootMelody();
   delay(3000);
 
-  if (rtc.begin()&&!rtc.lostPower()){
-    timeSource=TS_RTC; goToHome(); return;
-  }
-
-  // No RTC — start hotspot for time sync
-  startHotspot();
-  appState=STATE_TIME_SYNC_AP;
-  drawTimeSyncAP();
+  if(rtc.begin()&&!rtc.lostPower()){timeSource=TS_RTC;goToHome();return;}
+  startHotspot();appState=STATE_TIME_SYNC_AP;drawTimeSyncAP();
 }
 
 
 // ════════════════════════════════════════════════════════════
 //  LOOP
 // ════════════════════════════════════════════════════════════
-void loop() {
+void loop(){
   bool aShort,aLong,bShort,bLong;
   handleBtn(BTN_A,btnA_pt,btnA_held,btnA_proc,aShort,aLong);
   handleBtn(BTN_B,btnB_pt,btnB_held,btnB_proc,bShort,bLong);
 
+  // ── Per-second clock decode + alarm check ───────────────
+  static unsigned long lastSec=0;
+  if(millis()-lastSec>=1000){
+    lastSec=millis();
+    decodeEpoch(nowEpoch());
+    checkAlarms();
+    // Trigger popup if alarm fired and we're not already showing it
+    if(alarmFiring&&appState!=STATE_ALARM_POPUP){
+      stateBeforeAlarm=appState;
+      appState=STATE_ALARM_POPUP;
+      drawAlarmPopup();
+    }
+  }
+
   switch(appState){
 
-    // ── Time sync waiting ──────────────────────────────────
     case STATE_TIME_SYNC_AP:
       server.handleClient();
-      if(timeSynced){ stopHotspot(); drawSyncDone(); delay(2000); goToHome(); }
-      if(bLong){ sfx_Back(); stopHotspot(); swEpoch=0; swMillis=millis(); timeSource=TS_SOFTWARE; goToHome(); }
+      if(timeSynced){stopHotspot();drawSyncDone();delay(2000);goToHome();}
+      if(bLong){sfx_Back();stopHotspot();swEpoch=0;swMillis=millis();timeSource=TS_SOFTWARE;goToHome();}
       break;
 
-    // ── Setup AP ───────────────────────────────────────────
     case STATE_SETUP_AP:
       server.handleClient();
-      if(setupSaved){
-        sfx_Saved();
-        stopHotspot();
-        drawSetupSaved();
-        delay(2000);
-        goToMainMenu();
-      }
-      if(bLong){ sfx_Back(); stopHotspot(); goToMainMenu(); }
+      if(setupSaved){sfx_Saved();stopHotspot();drawSetupSaved();delay(2000);goToMainMenu();}
+      if(bLong){sfx_Back();stopHotspot();goToMainMenu();}
       break;
 
-    // ── Home clock ─────────────────────────────────────────
+    // ── ALARM POPUP ───────────────────────────────────────
+    case STATE_ALARM_POPUP:
+      // Ring the buzzer every ~500ms while alarm is active
+      if(alarmFiring){
+        static unsigned long lastRing=0;
+        if(millis()-lastRing>=500){lastRing=millis();sfx_AlarmTick();}
+        // Auto-dismiss after ALARM_BUZZ_MS
+        if(millis()-alarmStartMs>=ALARM_BUZZ_MS){
+          alarmFiring=false;firingAlarmIdx=-1;noTone(BUZZER_PIN);
+          appState=stateBeforeAlarm;
+          // Redraw the previous screen
+          if(appState==STATE_HOME_CLOCK) drawHomeClock();
+          else if(appState==STATE_STUDY_RUNNING) drawStudyRunning();
+          else if(appState==STATE_EXERCISE_RUNNING) drawExerciseRunning();
+          else drawHomeClock();
+        }
+      }
+      // Any button dismisses alarm
+      if(aShort||bShort||aLong||bLong){
+        noTone(BUZZER_PIN);
+        alarmFiring=false;firingAlarmIdx=-1;
+        sfx_ButtonClick();
+        appState=stateBeforeAlarm;
+        if(appState==STATE_HOME_CLOCK) drawHomeClock();
+        else if(appState==STATE_STUDY_RUNNING) drawStudyRunning();
+        else if(appState==STATE_EXERCISE_RUNNING) drawExerciseRunning();
+        else drawHomeClock();
+      }
+      break;
+
     case STATE_HOME_CLOCK:{
       unsigned long now=millis();
       if(now-lastClockUpdate>=1000){lastClockUpdate=now;drawHomeClock();}
@@ -1047,7 +1181,6 @@ void loop() {
       break;
     }
 
-    // ── Main menu (3 items) ────────────────────────────────
     case STATE_MAIN_MENU:
       if(aShort){sfx_Navigate();menuCursor=(menuCursor+1)%3;drawMainMenu();}
       if(bShort){
@@ -1059,14 +1192,12 @@ void loop() {
       if(bLong){sfx_Back();goToHome();}
       break;
 
-    // ── Session select ─────────────────────────────────────
     case STATE_SESSION_SELECT:
       if(aShort){sfx_Navigate();sessionCursor=(sessionCursor+1)%3;drawSessionSelect();}
       if(bShort){sfx_Confirm();startStudy();}
       if(bLong){sfx_Back();goToMainMenu();}
       break;
 
-    // ── Study running ──────────────────────────────────────
     case STATE_STUDY_RUNNING:
       if(aShort){
         studyPaused=!studyPaused;
@@ -1084,7 +1215,6 @@ void loop() {
       }
       break;
 
-    // ── Exercise running ───────────────────────────────────
     case STATE_EXERCISE_RUNNING:
       if(aShort){
         exercisePaused=!exercisePaused;
@@ -1101,20 +1231,17 @@ void loop() {
             for(int i=0;i<numExercises;i++){if(exerciseElapsed>=atSecond[i])prevIdx=i;else break;}
             exerciseElapsed++;
             for(int i=0;i<numExercises;i++){if(exerciseElapsed>=atSecond[i])newIdx=i;else break;}
-            if(newIdx!=prevIdx) sfx_ExerciseChange();
+            if(newIdx!=prevIdx)sfx_ExerciseChange();
             drawExerciseRunning();
-          } else {
-            sfx_Done();exerciseRunning=false;doneIsExercise=true;appState=STATE_DONE;drawDone();
-          }
+          }else{sfx_Done();exerciseRunning=false;doneIsExercise=true;appState=STATE_DONE;drawDone();}
         }
       }
       break;
 
-    // ── Done ───────────────────────────────────────────────
     case STATE_DONE:
       if(aShort||bShort||aLong||bLong){sfx_ButtonClick();goToHome();}
       break;
 
-    default: break;
+    default:break;
   }
 }
